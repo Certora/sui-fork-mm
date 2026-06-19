@@ -1,0 +1,35 @@
+# Copyright (c) Mysten Labs, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "sui-adapter-typing-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+# Native LibAFL harness. Coverage comes from libafl_targets' sancov hooks; the sancov
+# instrumentation is supplied via .cargo/config.toml rustflags.
+libafl = "0.15.4"
+libafl_bolts = "0.15.4"
+libafl_targets = { version = "0.15.4", default-features = false, features = [
+    "std",
+    "sancov_pcguard_hitcounts",
+] }
+
+bcs.workspace = true
+
+# Path deps keep types identical to the workspace build.
+sui-adapter-latest = { path = ".." }
+sui-move-natives-latest = { path = "../../sui-move-natives" }
+sui-types = { path = "../../../../crates/sui-types" }
+sui-framework = { path = "../../../../crates/sui-framework" }
+sui-protocol-config = { path = "../../../../crates/sui-protocol-config" }
+move-vm-runtime = { path = "../../../../external-crates/move/crates/move-vm-runtime" }
+
+[[bin]]
+name = "translate_and_verify"
+path = "fuzz_targets/translate_and_verify.rs"
+test = false
+doc = false
+bench = false

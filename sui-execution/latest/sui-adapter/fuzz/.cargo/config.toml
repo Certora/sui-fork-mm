@@ -1,0 +1,23 @@
+# Copyright (c) Mysten Labs, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# SanitizerCoverage instrumentation for the native LibAFL harness. These flags make rustc emit
+# trace-pc-guard callbacks that libafl_targets (feature `sancov_pcguard_hitcounts`) collects into
+# the edges map. Applies to every crate compiled while cargo runs from this directory, so the
+# whole `sui-adapter` pipeline is instrumented (separate fingerprint => one-time recompile).
+#
+# Only effective when cargo is invoked from within `fuzz/` (CWD-based config discovery). Building
+# the crate as a plain workspace member from the repo root skips these flags and just produces an
+# uninstrumented binary, which still compiles and links.
+# An explicit target is REQUIRED: it makes cargo apply the rustflags below only to target
+# artifacts, not to host build-scripts/proc-macros (which don't link libafl_targets and would
+# otherwise fail with undefined `__sanitizer_cov_trace_pc_guard*` symbols). Change this triple to
+# match your host if you're not on Apple Silicon (e.g. x86_64-apple-darwin, x86_64-unknown-linux-gnu).
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = [
+    "-Cpasses=sancov-module",
+    "-Cllvm-args=-sanitizer-coverage-level=4",
+    "-Cllvm-args=-sanitizer-coverage-trace-pc-guard",
+    "--cfg=fuzzing",
+]

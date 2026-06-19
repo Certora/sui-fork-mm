@@ -1,3 +1,4 @@
+*.vi
 # IDE and agents
 **/.history/
 **/.vscode/

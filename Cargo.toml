@@ -212,6 +212,7 @@ members = [
     "sui-execution",
     "sui-execution/cut",
     "sui-execution/latest/sui-adapter",
+    "sui-execution/latest/sui-adapter/fuzz",
     "sui-execution/latest/sui-move-natives",
     "sui-execution/latest/sui-verifier",
     "sui-execution/v0/sui-adapter",
