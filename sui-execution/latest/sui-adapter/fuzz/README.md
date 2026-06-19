@@ -81,8 +81,10 @@ simultaneously:
 ./translate_and_verify --record-deltas --rss-threshold-from rss_deltas.log
 ```
 
-Once you are happy with the derived value, update `RSS_DELTA_LIMIT_BYTES` in
-`translate_and_verify.rs` to make it the new compile-time default.
+After calibration, pass `--rss-threshold-from rss_deltas.log` on every run to
+apply the derived threshold automatically.  If you want to avoid repeating the
+flag, update `RSS_DELTA_LIMIT_BYTES` in `translate_and_verify.rs` to bake the
+value in as the compile-time default and rebuild.
 
 Interesting corpus entries accumulate in `./corpus/`.
 Crashes and timeouts are saved to `./crashes/`.
