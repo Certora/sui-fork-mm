@@ -281,6 +281,13 @@ fn main() -> Result<(), libafl::Error> {
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
+    // Force the thread-local fixture to initialize NOW in the parent process.
+    // thread_local statics are initialized lazily on first access; if the first
+    // access happens inside the harness (which runs in the forked child),
+    // Fixture::new() would run in every child — paying full VM + framework
+    // package loading cost (~50 ms) on every iteration instead of once.
+    FIXTURE.with(|_| {});
+
     // InProcessForkExecutor forks before each iteration so an OOM kill in the child
     // does not take down the fuzzer.  The parent catches SIGCHLD and records the
     // ExitKind (Crash / Timeout / Ok) without being affected by the child's death.

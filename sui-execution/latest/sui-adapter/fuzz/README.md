@@ -14,20 +14,27 @@ finding.
 ## Running
 
 ```sh
-# 1. Build the corpus generation program
-cargo build --release --bin gen_corpus
+# 1. Build from inside fuzz/ — REQUIRED for sancov instrumentation.
+#    The .cargo/config.toml that injects the coverage flags is CWD-based;
+#    building from the repo root silently skips it and produces an
+#    uninstrumented binary (edges: 0/2097152, corpus grows from TimeFeedback only).
+cd sui-execution/latest/sui-adapter/fuzz
 
-# 2. Build the fuzzer (release for realistic performance)
+cargo build --release --bin gen_corpus
 cargo build --release --bin translate_and_verify
 
-# 3. Workspace
-mkdir fuzz-test
-cp target/release/{gen_corpus,translate_and_verify} fuzz-test/
-cd fuzz-test
+# 2. Workspace
+mkdir -p /path/to/fuzz-test
+cp target/x86_64-unknown-linux-gnu/release/{gen_corpus,translate_and_verify} /path/to/fuzz-test/
+cd /path/to/fuzz-test
 
-# 4. Generate the corpus
+# 3. Generate the corpus
 ./gen_corpus
 ```
+
+> **Verify instrumentation:** at startup the fuzzer should report a non-zero edge
+> count well below 2M, e.g. `edges: 85/183339 (0%)`.  If you see `edges: 0/2097152`
+> the binary was built without sancov — rebuild from inside `fuzz/`.
 
 > **macOS users:** `.cargo/config.toml` hard-codes `target = "x86_64-unknown-linux-gnu"`.
 > Change it to match your host before building, e.g. `aarch64-apple-darwin` for Apple
