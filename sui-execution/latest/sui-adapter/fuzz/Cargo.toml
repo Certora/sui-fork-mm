@@ -18,6 +18,8 @@ libafl_targets = { version = "0.15.4", default-features = false, features = [
 ] }
 
 bcs.workspace = true
+move-core-types.workspace = true
+libc = "0.2"
 
 # Path deps keep types identical to the workspace build.
 sui-adapter-latest = { path = ".." }
@@ -30,6 +32,13 @@ move-vm-runtime = { path = "../../../../external-crates/move/crates/move-vm-runt
 [[bin]]
 name = "translate_and_verify"
 path = "fuzz_targets/translate_and_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gen_corpus"
+path = "fuzz_targets/gen_corpus.rs"
 test = false
 doc = false
 bench = false

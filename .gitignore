@@ -1,3 +1,7 @@
+**/*-certora/
+**/corpus/
+**/crashes/
+*.log
 *.vi
 # IDE and agents
 **/.history/

@@ -14428,6 +14428,8 @@ dependencies = [
  "libafl",
  "libafl_bolts",
  "libafl_targets",
+ "libc",
+ "move-core-types",
  "move-vm-runtime",
  "sui-adapter-latest",
  "sui-framework",
