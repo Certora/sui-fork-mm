@@ -23,7 +23,7 @@ use std::{
 use libafl::{
     corpus::OnDiskCorpus,
     events::SimpleEventManager,
-    executors::{ExitKind, InProcessForkExecutor},
+    executors::{ExitKind, InProcessExecutor},
     feedbacks::{
         CrashFeedback, EagerOrFeedback, MaxMapFeedback, NewHashFeedback, TimeFeedback,
         TimeoutFeedback,
@@ -43,7 +43,6 @@ use libafl::{
 use libafl_bolts::{
     AsSlice,
     rands::StdRand,
-    shmem::{ShMemProvider, StdShMemProvider},
     tuples::tuple_list,
 };
 use libafl_targets::std_edges_map_observer;
@@ -281,25 +280,30 @@ fn main() -> Result<(), libafl::Error> {
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    // Force the thread-local fixture to initialize NOW in the parent process.
-    // thread_local statics are initialized lazily on first access; if the first
-    // access happens inside the harness (which runs in the forked child),
-    // Fixture::new() would run in every child — paying full VM + framework
-    // package loading cost (~50 ms) on every iteration instead of once.
-    FIXTURE.with(|_| {});
+    // Limit virtual address space so pathological inputs that exhaust memory trigger
+    // ENOMEM → allocator abort → SIGABRT, which LibAFL's in-process signal handler
+    // catches as ExitKind::Crash.  Without this limit an OOM would SIGKILL the
+    // entire fuzzer process.  4 GiB is well above any legitimate PTB; the corpus
+    // calibration threshold (RSS_DELTA_LIMIT_BYTES / --rss-threshold-from) provides
+    // the finer-grained signal for moderate over-allocation.
+    unsafe {
+        let limit = 4u64 * 1024 * 1024 * 1024;
+        let rlim = libc::rlimit { rlim_cur: limit, rlim_max: limit };
+        libc::setrlimit(libc::RLIMIT_AS, &rlim);
+    }
 
-    // InProcessForkExecutor forks before each iteration so an OOM kill in the child
-    // does not take down the fuzzer.  The parent catches SIGCHLD and records the
-    // ExitKind (Crash / Timeout / Ok) without being affected by the child's death.
-    let shmem_provider = StdShMemProvider::new()?;
-    let mut executor = InProcessForkExecutor::new(
+    // InProcessExecutor runs the harness in the same process so the parent's static
+    // EDGES_MAP is written directly by the sancov hooks — MaxMapFeedback sees every
+    // edge hit.  InProcessForkExecutor was previously used for OOM isolation but the
+    // child's CoW copy of EDGES_MAP is never visible to the parent, making coverage
+    // permanently stuck at 0.  OOM isolation is now provided by RLIMIT_AS above.
+    let mut executor = InProcessExecutor::with_timeout(
         &mut harness,
         tuple_list!(edges_observer, time_observer, backtrace_observer),
         &mut fuzzer,
         &mut state,
         &mut mgr,
         Duration::from_millis(500),
-        shmem_provider,
     )?;
 
     // Load the BCS-seeded corpus produced by gen_corpus; fall back to a small

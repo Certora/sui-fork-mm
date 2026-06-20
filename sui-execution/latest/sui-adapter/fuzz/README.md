@@ -15,9 +15,9 @@ finding.
 
 ```sh
 # 1. Build from inside fuzz/ — REQUIRED for sancov instrumentation.
-#    The .cargo/config.toml that injects the coverage flags is CWD-based;
-#    building from the repo root silently skips it and produces an
-#    uninstrumented binary (edges: 0/2097152, corpus grows from TimeFeedback only).
+#    The .cargo/config.toml and rustc_sancov_wrapper.sh that inject the coverage
+#    flags are CWD-based; building from the repo root silently skips them and
+#    produces an uninstrumented binary (edges: 0/2097152).
 cd sui-execution/latest/sui-adapter/fuzz
 
 cargo build --release --bin gen_corpus
@@ -30,16 +30,23 @@ cd /path/to/fuzz-test
 
 # 3. Generate the corpus
 ./gen_corpus
+
+# 4. Run
+./translate_and_verify
 ```
 
 > **Verify instrumentation:** at startup the fuzzer should report a non-zero edge
-> count well below 2M, e.g. `edges: 85/183339 (0%)`.  If you see `edges: 0/2097152`
-> the binary was built without sancov — rebuild from inside `fuzz/`.
+> count in the thousands, e.g. `edges: 1425/8681 (16%)`.  If you see
+> `edges: 0/2097152` the binary was built without sancov — rebuild from inside
+> `fuzz/`.  If you see `edges: 0/8681` the sancov wrapper is active but
+> `InProcessExecutor` is not writing back edge hits — check that the binary was
+> not accidentally built with `InProcessForkExecutor`.
 
-> **macOS users:** `.cargo/config.toml` hard-codes `target = "x86_64-unknown-linux-gnu"`.
-> Change it to match your host before building, e.g. `aarch64-apple-darwin` for Apple
-> Silicon or `x86_64-apple-darwin` for Intel Macs.  Update the binary path in the
-> commands below accordingly.
+> **macOS users:** `rustc_sancov_wrapper.sh` and `.cargo/config.toml` hard-code
+> `target = "x86_64-unknown-linux-gnu"`.  Change the target triple to match your
+> host before building, e.g. `aarch64-apple-darwin` for Apple Silicon or
+> `x86_64-apple-darwin` for Intel Macs.  Update the binary path in the copy
+> command above accordingly.
 
 ### Re-calibrating the RSS threshold (recommended before a full campaign)
 
@@ -89,9 +96,9 @@ simultaneously:
 ```
 
 After calibration, pass `--rss-threshold-from rss_deltas.log` on every run to
-apply the derived threshold automatically.  If you want to avoid repeating the
-flag, update `RSS_DELTA_LIMIT_BYTES` in `translate_and_verify.rs` to bake the
-value in as the compile-time default and rebuild.
+apply the derived threshold automatically.  If you want to bake the value in
+permanently, update `RSS_DELTA_LIMIT_BYTES` in `translate_and_verify.rs` and
+rebuild.
 
 Interesting corpus entries accumulate in `./corpus/`.
 Crashes and timeouts are saved to `./crashes/`.
@@ -170,16 +177,41 @@ decode as a valid PTB it returns `Skipped` and havoc handles it as raw bytes.
 |--------|---------|
 | `MaxMapFeedback` (edge coverage) | Standard coverage-guided novelty — keeps inputs that reach new code |
 | `TimeFeedback` | Keeps inputs that take longer than average even without new coverage, steering toward allocation-heavy paths |
-| `CrashFeedback` | Detects panics and `invariant_violation!` aborts in the child process |
-| `TimeoutFeedback` (500 ms limit) | OOM-triggering inputs typically manifest as timeouts before the kernel OOM-kills the child |
+| `CrashFeedback` | Detects panics and `invariant_violation!` aborts |
+| `TimeoutFeedback` (500 ms limit) | OOM-triggering inputs typically manifest as timeouts before the process hits the virtual-memory ceiling |
 | `NewHashFeedback` (backtrace dedup) | A crash/timeout is only saved to `./crashes/` if its backtrace hash is new — prevents the crash corpus filling with thousands of inputs that all hit the same allocation path |
 
 ### Executor and OOM isolation
 
-The fuzzer uses `InProcessForkExecutor`: the parent process forks before each
-iteration and the harness runs in the child.  An OOM kill (`SIGKILL`) in the
-child does not affect the fuzzer — the parent catches `SIGCHLD`, records the
-exit status, and continues.
+The fuzzer uses `InProcessExecutor` with a 500 ms timeout.  Running in-process
+means the static `EDGES_MAP` written by the sancov hooks is directly visible to
+`MaxMapFeedback` in the same process — no copy-on-write gap.
+
+OOM isolation is provided by `setrlimit(RLIMIT_AS, 4 GiB)` set at startup.
+When an input exhausts virtual address space, `mmap` returns `ENOMEM`, Rust's
+allocator calls `abort()`, and LibAFL's in-process `SIGABRT` handler catches
+the signal as `ExitKind::Crash`, saves the input to `./crashes/`, and continues
+fuzzing.  The 4 GiB ceiling is well above any legitimate PTB; the RSS delta
+guard provides the finer-grained signal for moderate over-allocation.
+
+> **Why not `InProcessForkExecutor`?**  Fork-based execution isolates each
+> iteration in a child process, but the child inherits the static `EDGES_MAP`
+> as a copy-on-write page.  Any sancov writes in the child go to the child's
+> private copy and are never visible to the parent's `MaxMapFeedback`.  The
+> result is permanently `edges: 0/N` — coverage signal is completely lost.
+
+### Coverage scoping
+
+`rustc_sancov_wrapper.sh` is invoked as `rustc-wrapper` by `.cargo/config.toml`.
+It adds the sancov flags (`-Cpasses=sancov-module`,
+`-sanitizer-coverage-trace-pc-guard`, etc.) **only** when compiling the
+`sui_adapter_latest` crate, and passes `--cfg=fuzzing` to all crates.
+
+Without scoping, the full dependency closure (~183K edges) is instrumented.
+The 85 edges that are ever reached belong to fixture-initialisation code in
+dependency crates, and `MaxMapFeedback` saturates in the first minute.  With
+scoping, only the typing pipeline is instrumented (~8681 edges), making every
+new branch in `translate_and_verify` a genuine corpus event.
 
 An RSS delta guard reads `VmRSS` from `/proc/self/status` before and after each
 harness call (unlike `getrusage`, which returns a peak-ever value on Linux and
