@@ -8,6 +8,10 @@ pub use checked::*;
 pub mod checked {
 
     use crate::sui_types::gas::SuiGasStatusAPI;
+    // The interpreter/effects gas path is compiled out under `--cfg=fuzzing` (it
+    // operates on `TemporaryStore`, which is itself removed from the fuzz build).
+    // The translation meter the fuzz harness uses never touches these methods.
+    #[cfg(not(fuzzing))]
     use crate::temporary_store::TemporaryStore;
     use either::Either;
     use indexmap::IndexMap;
@@ -122,6 +126,7 @@ pub mod checked {
     }
 
     impl GasCharger {
+        #[cfg(not(fuzzing))]
         pub fn new(
             tx_digest: TransactionDigest,
             payment_kind: PaymentKind,
@@ -251,6 +256,7 @@ pub mod checked {
         // This function panics if errors are found while operation on the gas coins.
         // Transaction and certificate input checks must have insured that all gas coins
         // are correct.
+        #[cfg(not(fuzzing))]
         fn smash_gas(&mut self, temporary_store: &mut TemporaryStore<'_>) {
             match &mut self.payment {
                 PaymentMetadata::Unmetered | PaymentMetadata::Gasless => (),
@@ -290,6 +296,7 @@ pub mod checked {
             }
         }
 
+        #[cfg(not(fuzzing))]
         pub fn charge_input_objects(
             &mut self,
             temporary_store: &TemporaryStore<'_>,
@@ -328,6 +335,7 @@ pub mod checked {
 
         /// Resets any mutations, deletions, and events recorded in the store, as well as any storage costs and
         /// rebates, then Re-runs gas smashing. Effects on store are now as if we were about to begin execution
+        #[cfg(not(fuzzing))]
         pub fn reset(&mut self, temporary_store: &mut TemporaryStore<'_>) {
             temporary_store.drop_writes();
             self.gas_status.reset_storage_cost_and_rebate();
@@ -344,6 +352,7 @@ pub mod checked {
         ///   re-smash gas, then charge for storage
         /// - if we run out of gas while charging for storage, we have to dump all writes +
         ///   re-smash gas, then charge for storage again
+        #[cfg(not(fuzzing))]
         pub fn charge_gas<T, E: ExecutionErrorTrait>(
             &mut self,
             temporary_store: &mut TemporaryStore<'_>,
@@ -486,6 +495,7 @@ pub mod checked {
         /// v2: we charge (computation + storage costs for input objects - storage_rebates)
         ///     if the gas balance is still insufficient, we fall back to set computation_cost = gas_budget
         ///     so we charge net (gas_budget - storage_rebates)
+        #[cfg(not(fuzzing))]
         fn compute_storage_and_rebate<T, E: ExecutionErrorTrait>(
             &mut self,
             temporary_store: &mut TemporaryStore<'_>,
@@ -498,6 +508,7 @@ pub mod checked {
             }
         }
 
+        #[cfg(not(fuzzing))]
         fn handle_storage_and_rebate_v1<T, E: ExecutionErrorTrait>(
             &mut self,
             temporary_store: &mut TemporaryStore<'_>,
@@ -514,6 +525,7 @@ pub mod checked {
             }
         }
 
+        #[cfg(not(fuzzing))]
         fn handle_storage_and_rebate_v2<T, E: ExecutionErrorTrait>(
             &mut self,
             temporary_store: &mut TemporaryStore<'_>,
@@ -549,6 +561,7 @@ pub mod checked {
             std::iter::once(&self.smash_target).chain(self.smashed_payments.values())
         }
 
+        #[cfg(not(fuzzing))]
         fn smash_gas(
             &mut self,
             tx_digest: &TransactionDigest,

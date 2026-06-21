@@ -19,15 +19,23 @@ use sui_adapter_latest::{
         metering::translation_meter::TranslationMeter,
         typing,
     },
-    temporary_store::TemporaryStore,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use sui_types::{
-    base_types::{ObjectID, SuiAddress, TxContext},
+    TypeTag,
+    base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress, TxContext},
+    committee::EpochId,
     digests::TransactionDigest,
-    error::ExecutionErrorTrait,
+    error::{ExecutionError, ExecutionErrorTrait, SuiResult},
+    execution::{DynamicallyLoadedObjectMetadata, ExecutionResults},
     execution_status::ExecutionErrorKind,
     in_memory_storage::InMemoryStorage,
-    transaction::{InputObjects, ProgrammableTransaction},
+    object::Object,
+    storage::{
+        BackingPackageStore, ChildObjectResolver, DenyListResult, PackageObject, ParentSync,
+        Storage,
+    },
+    transaction::ProgrammableTransaction,
 };
 
 pub type Mode = Normal;
@@ -55,6 +63,99 @@ impl Fixture {
             store,
         }
     }
+}
+
+/// Minimal `ExecutionState` for the typing pipeline.
+///
+/// The production `TemporaryStore` is compiled out under `--cfg=fuzzing` (it is only
+/// needed by the interpreter/effects path), so the harness supplies its own. The
+/// loading/typing pass only ever issues object/package *reads*, which we delegate to
+/// the framework store; the mutating effects methods are unreachable here and are
+/// implemented as benign no-ops so a stray call can never manufacture a false crash.
+/// This type lives in the (uninstrumented) fuzz crate, so none of it counts toward
+/// sancov edges.
+struct HarnessState<'a> {
+    inner: &'a InMemoryStorage,
+}
+
+impl BackingPackageStore for HarnessState<'_> {
+    fn get_package_object(&self, package_id: &ObjectID) -> SuiResult<Option<PackageObject>> {
+        self.inner.get_package_object(package_id)
+    }
+}
+
+impl ChildObjectResolver for HarnessState<'_> {
+    fn read_child_object(
+        &self,
+        parent: &ObjectID,
+        child: &ObjectID,
+        child_version_upper_bound: SequenceNumber,
+    ) -> SuiResult<Option<Object>> {
+        self.inner
+            .read_child_object(parent, child, child_version_upper_bound)
+    }
+
+    fn get_object_received_at_version(
+        &self,
+        owner: &ObjectID,
+        receiving_object_id: &ObjectID,
+        receive_object_at_version: SequenceNumber,
+        epoch_id: EpochId,
+    ) -> SuiResult<Option<Object>> {
+        self.inner.get_object_received_at_version(
+            owner,
+            receiving_object_id,
+            receive_object_at_version,
+            epoch_id,
+        )
+    }
+}
+
+impl ParentSync for HarnessState<'_> {
+    fn get_latest_parent_entry_ref_deprecated(&self, object_id: ObjectID) -> Option<ObjectRef> {
+        self.inner.get_latest_parent_entry_ref_deprecated(object_id)
+    }
+}
+
+impl Storage for HarnessState<'_> {
+    fn read_object(&self, id: &ObjectID) -> Option<&Object> {
+        self.inner.get_object(id)
+    }
+
+    // Everything below is only reached by the interpreter/effects path, which the
+    // typing fuzz target never runs. Benign no-ops keep fuzz fidelity intact.
+    fn reset(&mut self) {}
+
+    fn record_execution_results(
+        &mut self,
+        _results: ExecutionResults,
+    ) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+
+    fn save_loaded_runtime_objects(
+        &mut self,
+        _loaded_runtime_objects: BTreeMap<ObjectID, DynamicallyLoadedObjectMetadata>,
+    ) {
+    }
+
+    fn save_wrapped_object_containers(
+        &mut self,
+        _wrapped_object_containers: BTreeMap<ObjectID, ObjectID>,
+    ) {
+    }
+
+    fn check_coin_deny_list(
+        &self,
+        _receiving_funds_type_and_owners: BTreeMap<TypeTag, BTreeSet<SuiAddress>>,
+    ) -> DenyListResult {
+        DenyListResult {
+            result: Ok(()),
+            num_non_gas_coin_owners: 0,
+        }
+    }
+
+    fn record_generated_object_ids(&mut self, _generated_ids: BTreeSet<ObjectID>) {}
 }
 
 /// Mirrors `static_programmable_transactions::execute` up to — but not including —
@@ -104,14 +205,9 @@ pub fn run_typing(
         protocol_config,
     );
 
-    let mut state_view = TemporaryStore::new(
-        &fixture.store,
-        InputObjects::new(vec![]),
-        /* receiving_objects */ vec![],
-        tx_digest,
-        protocol_config,
-        /* cur_epoch */ 0,
-    );
+    let mut state_view = HarnessState {
+        inner: &fixture.store,
+    };
     let state_view: &mut dyn ExecutionState = &mut state_view;
 
     // Use a closure with `?` so each stage can early-return while the outer
