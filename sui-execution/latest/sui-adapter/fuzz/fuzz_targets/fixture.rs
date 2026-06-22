@@ -20,6 +20,7 @@ use sui_adapter_latest::{
         typing,
     },
 };
+use move_compiler::{Compiler as MoveCompiler, shared::NumericalAddress};
 use std::collections::{BTreeMap, BTreeSet};
 use sui_types::{
     TypeTag,
@@ -40,6 +41,94 @@ use sui_types::{
 
 pub type Mode = Normal;
 
+/// Source for the fuzz-fixture package. Its module is declared at address
+/// `0xface` — distinct from every system package ID (`0x1`/`0x2`/`0x3`/`0xb`/
+/// `0xdee9`) so it can be added to the framework-only store without collision.
+/// `gen_corpus` references this same ID when building MoveCall seeds. It is
+/// deliberately self-contained (no
+/// `use` of any other package) so it has no transitive dependencies and can be
+/// inserted into the framework-only store as an initial package keyed solely on
+/// its own address. Its only purpose is to give `MoveCall` fuzz inputs a real,
+/// resolvable target with a wide variety of function signatures (primitives,
+/// vectors, references, generics with ability bounds, structs, and
+/// multiple-return functions) so the typing pass actually exercises MoveCall
+/// resolution instead of bailing out at linkage/loading.
+const FUZZ_FIXTURE_MODULE_SRC: &str = r#"
+module 0xface::fuzz_fixture {
+    public struct Box has copy, drop, store {
+        v: u64,
+    }
+
+    public struct Pair<T> has copy, drop {
+        a: T,
+        b: T,
+    }
+
+    public fun nothing() {}
+
+    public fun take_u8(x: u8): u8 { x }
+    public fun take_u64(x: u64): u64 { x }
+    public fun take_u128(x: u128): u128 { x }
+    public fun take_u256(x: u256): u256 { x }
+    public fun take_bool(b: bool): bool { b }
+    public fun take_address(a: address): address { a }
+
+    public fun take_vec_u64(_v: vector<u64>): u64 { 0 }
+    public fun take_vec_address(_v: vector<address>): u64 { 0 }
+
+    public fun use_imm_ref(_x: &u64): u64 { 0 }
+    public fun use_mut_ref(_x: &mut u64) {}
+
+    public fun identity<T>(x: T): T { x }
+    public fun ignore<T: drop>(_x: T) {}
+
+    public fun new_box(v: u64): Box { Box { v } }
+    public fun unbox(b: Box): u64 { b.v }
+    public fun box_value(b: &Box): u64 { b.v }
+
+    public fun make_pair<T: copy + drop>(a: T, b: T): Pair<T> { Pair { a, b } }
+
+    public fun two_values(): (u64, bool) { (0, false) }
+    public fun swap<T>(a: T, b: T): (T, T) { (b, a) }
+}
+"#;
+
+/// Compile [`FUZZ_FIXTURE_MODULE_SRC`] and wrap it as an initial package object.
+/// The package ID is taken from the module's self-address (`0xface`), so it is
+/// directly resolvable by PTBs that reference [`fuzz_fixture_package_id`].
+fn fuzz_fixture_package_object(
+    protocol_config: &sui_protocol_config::ProtocolConfig,
+) -> Object {
+    // Compile the self-contained source to a `CompiledModule` (mirrors the
+    // test-only `compile_units` dev util, which we can't depend on here). `std`
+    // is mapped to `0x1` for parity even though the module imports nothing.
+    let dir = tempfile::tempdir().expect("create tempdir for fixture source");
+    let file_path = dir.path().join("fuzz_fixture.move");
+    std::fs::write(&file_path, FUZZ_FIXTURE_MODULE_SRC).expect("write fixture source");
+
+    let named_addresses: std::collections::BTreeMap<&str, NumericalAddress> =
+        [("std", NumericalAddress::parse_str("0x1").unwrap())]
+            .into_iter()
+            .collect();
+    let (_, units) = MoveCompiler::from_files(
+        None,
+        vec![file_path.to_str().unwrap().to_string()],
+        vec![],
+        named_addresses,
+    )
+    .build_and_report()
+    .expect("fuzz fixture package failed to compile");
+
+    let modules: Vec<_> = units.into_iter().map(|u| u.named_module.module).collect();
+    Object::new_package(
+        &modules,
+        TransactionDigest::default(),
+        protocol_config,
+        /* transitive_dependencies */ [],
+    )
+    .expect("fuzz fixture package failed to build")
+}
+
 /// Owned, side-effect-free state held for the lifetime of the worker thread. Everything that
 /// *borrows* from these (the VM instances, the package store, the env) is rebuilt per iteration.
 pub struct Fixture {
@@ -54,9 +143,13 @@ impl Fixture {
         let natives = sui_move_natives_latest::all_natives(/* silent */ true, &protocol_config);
         let vm = sui_adapter_latest::adapter::new_move_runtime(natives, &protocol_config)
             .expect("failed to build MoveRuntime");
-        // Seed the store with the system packages only — this is the entire "framework".
-        let store =
-            InMemoryStorage::new(sui_framework::BuiltInFramework::genesis_objects().collect());
+        // Seed the store with the system packages plus a synthetic fuzz-fixture
+        // package, so MoveCall fuzz inputs have a resolvable target with diverse
+        // signatures (see `FUZZ_FIXTURE_MODULE_SRC`) rather than only the framework.
+        let mut objects: Vec<Object> =
+            sui_framework::BuiltInFramework::genesis_objects().collect();
+        objects.push(fuzz_fixture_package_object(&protocol_config));
+        let store = InMemoryStorage::new(objects);
         Self {
             protocol_config,
             vm,
