@@ -14432,12 +14432,15 @@ dependencies = [
  "move-compiler",
  "move-core-types",
  "move-vm-runtime",
+ "serde",
  "sui-adapter-latest",
  "sui-framework",
  "sui-move-natives-latest",
  "sui-protocol-config",
  "sui-types",
  "tempfile",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
 ]
 
 [[package]]

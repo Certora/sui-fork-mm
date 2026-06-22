@@ -250,7 +250,8 @@ real package resolution.
 
 ### Tier 3 — MoveCall into the synthetic fuzz-fixture package (26–32)
 
-The fixture module at address `0xface` is compiled at harness startup and
+The fuzz-fixture package ([`fuzz_fixture.rs`](fuzz_targets/fuzz_fixture.rs), address
+`0xface`) is compiled at harness startup and
 injected into the in-memory store alongside the system packages.  It exposes a
 wide variety of function signatures — primitives, vectors, references, generics
 with ability bounds, user-defined structs, and multiple-return functions — so
