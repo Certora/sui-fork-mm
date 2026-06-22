@@ -19,6 +19,8 @@ libafl_targets = { version = "0.15.4", default-features = false, features = [
 
 bcs.workspace = true
 move-core-types.workspace = true
+move-compiler.workspace = true
+tempfile.workspace = true
 libc = "0.2"
 
 # Path deps keep types identical to the workspace build.

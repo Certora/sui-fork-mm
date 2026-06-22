@@ -14429,6 +14429,7 @@ dependencies = [
  "libafl_bolts",
  "libafl_targets",
  "libc",
+ "move-compiler",
  "move-core-types",
  "move-vm-runtime",
  "sui-adapter-latest",
@@ -14436,6 +14437,7 @@ dependencies = [
  "sui-move-natives-latest",
  "sui-protocol-config",
  "sui-types",
+ "tempfile",
 ]
 
 [[package]]

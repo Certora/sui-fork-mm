@@ -10,7 +10,7 @@ use crate::{
     execution_mode::ExecutionMode,
     execution_value::ExecutionState,
     static_programmable_transactions::{
-        execution::context::subst_signature,
+        execution::typing_support::subst_signature,
         linkage::{analysis::LinkageAnalyzer, resolved_linkage::ExecutableLinkage},
         loading::ast::{self as L, Datatype, LoadedFunction, LoadedFunctionInstantiation, Type},
     },

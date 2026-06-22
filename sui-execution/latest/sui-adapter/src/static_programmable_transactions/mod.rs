@@ -5,6 +5,10 @@
 #![deny(clippy::indexing_slicing)]
 #![deny(clippy::cast_possible_truncation)]
 
+// These imports are only used by `execute` (the full pipeline driver, including
+// the interpreter), which is compiled out under `--cfg=fuzzing`. Gating the
+// imports as well avoids unused-import warnings in the fuzz build.
+#[cfg(not(fuzzing))]
 use crate::{
     data_store::{
         cached_package_store::CachedPackageStore,
@@ -17,10 +21,15 @@ use crate::{
         env::Env, linkage::analysis::LinkageAnalyzer, metering::translation_meter,
     },
 };
+#[cfg(not(fuzzing))]
 use move_trace_format::format::MoveTraceBuilder;
+#[cfg(not(fuzzing))]
 use move_vm_runtime::runtime::MoveRuntime;
+#[cfg(not(fuzzing))]
 use std::{cell::RefCell, rc::Rc, sync::Arc};
+#[cfg(not(fuzzing))]
 use sui_protocol_config::ProtocolConfig;
+#[cfg(not(fuzzing))]
 use sui_types::{
     base_types::TxContext, error::ExecutionErrorTrait, execution::ResultWithTimings,
     execution_status::ExecutionErrorKind, metrics::ExecutionMetrics, storage::BackingPackageStore,
@@ -35,6 +44,11 @@ pub mod metering;
 pub mod spanned;
 pub mod typing;
 
+// The full pipeline driver (typing + the interpreter tail) is only invoked by the
+// production `execution_engine`, which is itself compiled out under `--cfg=fuzzing`.
+// The typing fuzz harness drives the pipeline directly, so this is excluded from
+// the fuzz build to keep the interpreter out of sancov instrumentation.
+#[cfg(not(fuzzing))]
 pub fn execute<Mode: ExecutionMode>(
     protocol_config: &ProtocolConfig,
     metrics: Arc<ExecutionMetrics>,

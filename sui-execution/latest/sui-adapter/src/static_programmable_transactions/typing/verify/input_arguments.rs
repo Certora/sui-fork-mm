@@ -4,7 +4,7 @@
 use crate::{
     execution_mode::ExecutionMode,
     sp,
-    static_programmable_transactions::execution::context::{
+    static_programmable_transactions::execution::typing_support::{
         PrimitiveArgumentLayout, bcs_argument_validate,
     },
     static_programmable_transactions::{
