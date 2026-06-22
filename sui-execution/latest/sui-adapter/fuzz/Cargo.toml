@@ -42,3 +42,10 @@ path = "fuzz_targets/gen_corpus.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "replay"
+path = "fuzz_targets/replay.rs"
+test = false
+doc = false
+bench = false

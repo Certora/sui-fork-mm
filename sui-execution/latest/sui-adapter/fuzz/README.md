@@ -105,6 +105,94 @@ Crashes and timeouts are saved to `./crashes/`.
 
 ---
 
+## Triaging the crashes directory
+
+After a campaign the `./crashes/` directory contains every input that triggered
+the objective (crash, timeout, or RSS overage) with a unique backtrace hash.
+Not all of them are real bugs.  Use the `replay` binary to distinguish genuine
+findings from noise quickly.
+
+```sh
+# Build the replay tool (same build step as the fuzzer itself)
+cd sui-execution/latest/sui-adapter/fuzz
+cargo build --release --bin replay
+
+cp target/x86_64-unknown-linux-gnu/release/replay /path/to/fuzz-test/
+cd /path/to/fuzz-test
+```
+
+Run it against the whole directory:
+
+```sh
+./replay crashes/
+```
+
+Output is one line per file:
+
+```
+file                                                            bytes  stage         anon_rss∆   wall_ms
+----------------------------------------------------------------------------------------------------------
+e101a7f8bedac268                                             1260376  typing_ok        9.3 MiB        24
+9eb9b79caa72d02d                                               1424  decode_fail      0.0 MiB         0
+...
+```
+
+**Interpreting the columns:**
+
+| Column | Meaning |
+|--------|---------|
+| `stage` | Where the pipeline stopped: `decode_fail` (BCS parse error), `linkage_fail`, `loading_fail`, or `typing_ok` (reached and completed translate_and_verify) |
+| `anon_rss∆` | Net change in anonymous RSS (heap + stack only) over the iteration — a proxy for per-input allocation |
+| `wall_ms` | Wall-clock time for the iteration |
+| `*** PANIC ***` | The input triggered a panic or `invariant_violation!` — a real finding |
+| `*** RSS ***` | `anon_rss∆` exceeded 62 MiB — a potential OOM finding |
+
+**What to look for:**
+
+- Any line with `*** PANIC ***` is a real bug.  Replay that single file to get the full backtrace:
+  ```sh
+  RUST_BACKTRACE=1 ./replay crashes/<hash>
+  ```
+- Lines where `stage = decode_fail` or `loading_fail` are almost certainly false positives — the input never reached the target.
+- `typing_ok` with low `anon_rss∆` and short `wall_ms` that re-runs cleanly indicates the objective was triggered by RSS baseline drift during a long in-process campaign (the `VmRSS` snapshot before the iteration was elevated by shared memory accumulation, making the delta look larger than it was).  These are not findings.
+- High `anon_rss∆` values (≫ the 62 MiB threshold) on `typing_ok` inputs that don't panic are worth investigating: they indicate the typing pass allocates pathologically on certain input shapes even without crashing.
+
+**Prioritisation:**
+
+```sh
+# Panics first
+grep 'PANIC' <(./replay crashes/)
+
+# Then large anon RSS on typing_ok inputs
+./replay crashes/ | awk '$3=="typing_ok" {gsub(/MiB/,""); if ($4+0 > 20) print}' | sort -k4 -rn
+
+# Ignore decode_fail and loading_fail entirely
+./replay crashes/ | grep -v 'decode_fail\|loading_fail'
+```
+
+### Known false-positive pattern: RSS baseline drift
+
+`InProcessExecutor` runs the harness in the same process across all iterations.
+Over a long campaign the process RSS grows steadily: the corpus accumulates in
+memory, LibAFL's shared-memory edge map and backtrace observer expand, and the
+Rust allocator's free lists grow.  If the per-iteration delta is measured
+against the live RSS (`VmRSS`), this baseline drift is baked into the "before"
+snapshot, inflating small legitimate allocations into apparent threshold
+violations.
+
+The harness now measures `RssAnon` (private anonymous pages only) rather than
+`VmRSS`.  `VmRSS = RssAnon + RssFile + RssShmem`; the file-backed and
+shared-memory components fluctuate with kernel paging activity and accumulate
+with LibAFL's own shared-memory segments independently of anything the input
+causes.  `RssAnon` eliminates those two components.  It does not give a
+perfectly isolated view of harness-only allocations — the Rust allocator's
+free lists are also anonymous heap pages and grow over time — but the delta is
+measured tightly within the harness closure, so LibAFL's own per-iteration
+allocations (which run outside the closure) are excluded.  The result is
+significantly less drift than `VmRSS`, not zero drift.
+
+---
+
 ## Corpus generator (`gen_corpus`)
 
 `gen_corpus` produces BCS-serialized `ProgrammableTransaction` files that give
@@ -179,7 +267,7 @@ decode as a valid PTB it returns `Skipped` and havoc handles it as raw bytes.
 | `TimeFeedback` | Keeps inputs that take longer than average even without new coverage, steering toward allocation-heavy paths |
 | `CrashFeedback` | Detects panics and `invariant_violation!` aborts |
 | `TimeoutFeedback` (500 ms limit) | OOM-triggering inputs typically manifest as timeouts before the process hits the virtual-memory ceiling |
-| `NewHashFeedback` (backtrace dedup) | A crash/timeout is only saved to `./crashes/` if its backtrace hash is new — prevents the crash corpus filling with thousands of inputs that all hit the same allocation path |
+| `NewHashFeedback` (backtrace dedup) | Combined with `EagerAndFeedback`: a finding is saved **only if** it is a crash/timeout **and** its backtrace hash is new — both conditions must hold |
 
 ### Executor and OOM isolation
 
@@ -213,18 +301,37 @@ dependency crates, and `MaxMapFeedback` saturates in the first minute.  With
 scoping, only the typing pipeline is instrumented (~8681 edges), making every
 new branch in `translate_and_verify` a genuine corpus event.
 
-An RSS delta guard reads `VmRSS` from `/proc/self/status` before and after each
-harness call (unlike `getrusage`, which returns a peak-ever value on Linux and
-produces a zero delta).  Any input that causes net allocation above
-`RSS_DELTA_LIMIT_BYTES` is treated as a crash and saved to `./crashes/`.
-Because all RSS-triggered findings share an empty backtrace, `NewHashFeedback`
-deduplicates them to a single saved file.
+### RSS delta guard
+
+An RSS delta guard reads `RssAnon` from `/proc/self/status` before and after
+each harness call.  `RssAnon` covers only private anonymous pages (heap +
+stack), so it excludes two sources of noise that `VmRSS` picks up:
+file-backed pages (`RssFile`) paged in/out by the kernel on its own schedule,
+and shared-memory segments (`RssShmem`) — LibAFL's edge map and backtrace
+observer live here and accumulate steadily over a long in-process run.
+Using `VmRSS` causes baseline drift: the "before" snapshot is already elevated
+by those accumulated shared pages, inflating small legitimate allocations into
+apparent threshold violations.
+
+`RssAnon` is not a perfectly isolated view of harness-only allocations — the
+Rust allocator retains freed memory in its free lists rather than returning it
+to the OS, so even after `run_typing` drops all its data structures the
+anonymous RSS may not decrease.  The delta is still meaningful because it is
+measured within the harness closure: LibAFL's per-iteration work (input
+selection, mutation, corpus updates, feedback evaluation) runs *outside* the
+closure, so its allocations do not appear in the delta window.  What the metric
+captures is: BCS deserialization + `run_typing` allocations + any allocator
+free-list growth caused by those calls.  Long campaigns can still drift, but
+orders of magnitude more slowly than with `VmRSS`.
+
+Any input whose `RssAnon` delta exceeds `RSS_DELTA_LIMIT_BYTES` is treated as a
+crash and saved to `./crashes/`.
 
 The threshold is set empirically: `gen_corpus` runs each seed through the real
-pipeline, reports the RSS delta per file, and suggests **5× the worst-case
-observed value**.  The seeds are already hand-crafted extremes, so a legitimate
-fuzz mutation is unlikely to allocate more than a few multiples of the worst
-seed; 5× leaves headroom without being so generous that anomalous inputs go
+pipeline, reports the delta per file, and suggests **5× the worst-case observed
+value**.  The seeds are already hand-crafted extremes, so a legitimate fuzz
+mutation is unlikely to allocate more than a few multiples of the worst seed;
+5× leaves headroom without being so generous that anomalous inputs go
 undetected.  As of the current seed set the worst case is
 `04_make_move_vec_fan_out_255` at ~12.3 MiB, giving a threshold of **62 MiB**.
 

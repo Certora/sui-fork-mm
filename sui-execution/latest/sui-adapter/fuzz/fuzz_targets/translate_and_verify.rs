@@ -25,8 +25,8 @@ use libafl::{
     events::SimpleEventManager,
     executors::{ExitKind, InProcessExecutor},
     feedbacks::{
-        CrashFeedback, EagerOrFeedback, MaxMapFeedback, NewHashFeedback, TimeFeedback,
-        TimeoutFeedback,
+        CrashFeedback, EagerAndFeedback, EagerOrFeedback, MaxMapFeedback, NewHashFeedback,
+        TimeFeedback, TimeoutFeedback,
     },
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::{BytesInput, HasTargetBytes},
@@ -80,15 +80,18 @@ static DELTAS_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// RSS-delta distribution after a ~10-minute warm-up run.
 const RSS_DELTA_LIMIT_BYTES: u64 = 62 * 1024 * 1024;
 
-/// Returns current process RSS in bytes by reading `VmRSS` from `/proc/self/status`.
-/// Unlike `getrusage(RUSAGE_SELF).ru_maxrss` (which is a peak-ever value on Linux),
-/// this reflects the live working-set size and produces a meaningful delta.
-fn current_rss_bytes() -> u64 {
+/// Returns the process's anonymous RSS in bytes from `/proc/self/status` (RssAnon).
+///
+/// `VmRSS` includes file-backed and shared-memory pages that the kernel pages in/out
+/// independently of anything the harness allocates — it produces noisy deltas over a
+/// long run.  `RssAnon` covers only private anonymous mappings (heap + stack), so its
+/// delta directly reflects allocations made by the harness during a single iteration.
+fn current_anon_rss_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
+                .find(|l| l.starts_with("RssAnon:"))
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|v| v.parse::<u64>().ok())
         })
@@ -179,7 +182,7 @@ fn main() -> Result<(), libafl::Error> {
     // The closure run on each input (executes in the forked child).
     // Flags and limits are read from globals set before the first fork.
     let mut harness = |input: &BytesInput| {
-        let rss_before = current_rss_bytes();
+        let rss_before = current_anon_rss_bytes();
         let bytes = input.target_bytes();
         let decode_result = bcs::from_bytes::<ProgrammableTransaction>(bytes.as_slice());
         let stage_byte = match decode_result {
@@ -205,7 +208,7 @@ fn main() -> Result<(), libafl::Error> {
                 }
             }
         }
-        let rss_delta = current_rss_bytes().saturating_sub(rss_before);
+        let rss_delta = current_anon_rss_bytes().saturating_sub(rss_before);
         if RECORD_DELTAS.load(Ordering::Relaxed) {
             if let Some(path) = DELTAS_LOG_PATH.get() {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -234,10 +237,12 @@ fn main() -> Result<(), libafl::Error> {
         MaxMapFeedback::new(&edges_observer),
         TimeFeedback::new(&time_observer),
     );
-    // A finding is saved only when it is a crash/timeout AND its backtrace hash is new.
-    // This prevents the crashes/ directory from filling with thousands of inputs that all
-    // hit the same allocation path.
-    let mut objective = EagerOrFeedback::new(
+    // Save a finding only when BOTH conditions hold:
+    //   1. the iteration ended as a crash or timeout
+    //   2. the backtrace hash is new (deduplicates inputs that hit the same site)
+    // EagerAndFeedback short-circuits: if (1) is false, (2) is not evaluated and the
+    // hash set is not updated, so a non-crash input never consumes a dedup slot.
+    let mut objective = EagerAndFeedback::new(
         EagerOrFeedback::new(CrashFeedback::new(), TimeoutFeedback::new()),
         NewHashFeedback::new(&backtrace_observer),
     );
