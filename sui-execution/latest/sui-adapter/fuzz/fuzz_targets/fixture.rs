@@ -11,7 +11,7 @@ use sui_adapter_latest::{
     },
     execution_mode::{ExecutionMode, Normal},
     execution_value::ExecutionState,
-    gas_charger::GasCharger,
+    gas_charger::{GasCharger,GasPayment, PaymentLocation},
     static_programmable_transactions::{
         env::Env,
         linkage::analysis::LinkageAnalyzer,
@@ -22,7 +22,7 @@ use sui_adapter_latest::{
     temporary_store::TemporaryStore,
 };
 use sui_types::{
-    base_types::{SuiAddress, TxContext},
+    base_types::{ObjectID, SuiAddress, TxContext},
     digests::TransactionDigest,
     error::ExecutionErrorTrait,
     execution_status::ExecutionErrorKind,
@@ -86,7 +86,10 @@ pub fn run_typing(
 
     let tx_digest = TransactionDigest::default();
     let mut gas_charger = GasCharger::new_unmetered(tx_digest);
-    let gas_payment = gas_charger.gas_payment_amount();
+    let gas_payment = Some(GasPayment {
+        location: PaymentLocation::Coin(ObjectID::ZERO),
+        amount: u64::MAX,
+    });
 
     let tx_context = TxContext::new_from_components(
         &SuiAddress::ZERO,

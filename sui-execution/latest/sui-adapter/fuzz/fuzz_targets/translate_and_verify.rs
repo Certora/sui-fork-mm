@@ -86,7 +86,8 @@ const RSS_DELTA_LIMIT_BYTES: u64 = 62 * 1024 * 1024;
 /// independently of anything the harness allocates — it produces noisy deltas over a
 /// long run.  `RssAnon` covers only private anonymous mappings (heap + stack), so its
 /// delta directly reflects allocations made by the harness during a single iteration.
-fn current_anon_rss_bytes() -> u64 {
+#[cfg(target_os = "linux")]
+fn current_rss_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
@@ -95,8 +96,43 @@ fn current_anon_rss_bytes() -> u64 {
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|v| v.parse::<u64>().ok())
         })
-        .unwrap_or(0)
+        .unwrap_or(0)       // TODO gco: this should panic
         * 1024 // value is in kB
+}
+
+/// Returns current process RSS in bytes.
+///
+/// `getrusage(RUSAGE_SELF).ru_maxrss` is a peak value on Darwin, so it cannot
+/// produce meaningful per-input deltas. Mach task info exposes the current
+/// resident set size instead.
+#[cfg(target_os = "macos")]
+fn current_rss_bytes() -> u64 {
+    unsafe extern "C" {
+        #[link_name = "mach_task_self_"]
+        static MACH_TASK_SELF: libc::mach_port_t;
+    }
+
+    unsafe {
+        let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        let kr = libc::task_info(
+            MACH_TASK_SELF,
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        );
+        if kr == libc::KERN_SUCCESS {
+            info.assume_init().resident_size        // TODO lior: this is still the fuzz RSS (which includes the shmem). We should try `info.assume_init().phys_footprint` instead.
+        } else {
+            0                                       // TODO lior: this should panic
+        }
+    }
+}
+
+/// RSS accounting is only implemented for platforms used by this fuzz campaign.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_rss_bytes() -> u64 {
+    panic!("not implemented");
 }
 
 /// Read a deltas log (one u64 byte-count per line) and return the p99.9 value × 1.5,
@@ -182,7 +218,7 @@ fn main() -> Result<(), libafl::Error> {
     // The closure run on each input (executes in the forked child).
     // Flags and limits are read from globals set before the first fork.
     let mut harness = |input: &BytesInput| {
-        let rss_before = current_anon_rss_bytes();
+        let rss_before = current_rss_bytes();
         let bytes = input.target_bytes();
         let decode_result = bcs::from_bytes::<ProgrammableTransaction>(bytes.as_slice());
         let stage_byte = match decode_result {
@@ -208,7 +244,7 @@ fn main() -> Result<(), libafl::Error> {
                 }
             }
         }
-        let rss_delta = current_anon_rss_bytes().saturating_sub(rss_before);
+        let rss_delta = current_rss_bytes().saturating_sub(rss_before);
         if RECORD_DELTAS.load(Ordering::Relaxed) {
             if let Some(path) = DELTAS_LOG_PATH.get() {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -285,6 +321,29 @@ fn main() -> Result<(), libafl::Error> {
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
+    // Warm up BEFORE creating the timed executor. InProcessExecutor runs the harness
+    // on this thread, and its timeout is effectively armed relative to executor
+    // setup; the first input's one-time costs (building the thread-local fixture —
+    // MoveRuntime + framework — and the lazy module loading/verification triggered by
+    // the first typing pass) must therefore happen here, not inside the first timed
+    // execution. Otherwise that cost is charged against the per-iteration timeout and
+    // TimeoutFeedback records a spurious objective that aborts the campaign on
+    // iteration 1.
+    {
+        use sui_types::base_types::SuiAddress;
+        use sui_types::transaction::{Argument, CallArg, Command};
+        let warmup = ProgrammableTransaction {
+            inputs: vec![CallArg::Pure(bcs::to_bytes(&SuiAddress::ZERO).unwrap())],
+            commands: vec![Command::TransferObjects(
+                vec![Argument::GasCoin],
+                Argument::Input(0),
+            )],
+        };
+        FIXTURE.with(|fixture| {
+            let _ = run_typing(fixture, warmup);
+        });
+    }
+
     // Limit virtual address space so pathological inputs that exhaust memory trigger
     // ENOMEM → allocator abort → SIGABRT, which LibAFL's in-process signal handler
     // catches as ExitKind::Crash.  Without this limit an OOM would SIGKILL the
@@ -297,6 +356,18 @@ fn main() -> Result<(), libafl::Error> {
         libc::setrlimit(libc::RLIMIT_AS, &rlim);
     }
 
+    // Per-execution timeout. On Linux (the target platform) 500 ms is tight on
+    // purpose: a real typing pass is sub-millisecond, so a 500 ms execution is a hang
+    // or runaway allocation and TimeoutFeedback flags it. The default is overridable
+    // via TRANSLATE_VERIFY_TIMEOUT_MS — primarily for local smoke runs on macOS,
+    // where LibAFL's in-process (GCD) timeout fires spuriously at tight intervals even
+    // for sub-millisecond executions; setting e.g. TRANSLATE_VERIFY_TIMEOUT_MS=60000
+    // makes the campaign usable there without changing the Linux default.
+    let exec_timeout_ms = std::env::var("TRANSLATE_VERIFY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(500);
+
     // InProcessExecutor runs the harness in the same process so the parent's static
     // EDGES_MAP is written directly by the sancov hooks — MaxMapFeedback sees every
     // edge hit.  InProcessForkExecutor was previously used for OOM isolation but the
@@ -308,7 +379,7 @@ fn main() -> Result<(), libafl::Error> {
         &mut fuzzer,
         &mut state,
         &mut mgr,
-        Duration::from_millis(500),
+        Duration::from_millis(exec_timeout_ms),
     )?;
 
     // Load the BCS-seeded corpus produced by gen_corpus; fall back to a small

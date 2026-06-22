@@ -494,20 +494,59 @@ fn empty_ptb() -> ProgrammableTransaction {
     }
 }
 
-/// Returns current process RSS in bytes by reading `VmRSS` from `/proc/self/status`.
-/// Unlike `getrusage(RUSAGE_SELF).ru_maxrss` (which is a peak-ever value on Linux),
-/// this reflects the live working-set size and produces a meaningful delta.
+/// Returns the process's anonymous RSS in bytes from `/proc/self/status` (RssAnon).
+///
+/// `VmRSS` includes file-backed and shared-memory pages that the kernel pages in/out
+/// independently of anything the harness allocates — it produces noisy deltas over a
+/// long run.  `RssAnon` covers only private anonymous mappings (heap + stack), so its
+/// delta directly reflects allocations made by the harness during a single iteration.
+#[cfg(target_os = "linux")]
 fn current_rss_bytes() -> u64 {
-    fs::read_to_string("/proc/self/status")
+    std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {
             s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
+                .find(|l| l.starts_with("RssAnon:"))
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|v| v.parse::<u64>().ok())
         })
-        .unwrap_or(0)
+        .unwrap_or(0)       // TODO gco: this should panic
         * 1024 // value is in kB
+}
+
+/// Returns current process RSS in bytes.
+///
+/// `getrusage(RUSAGE_SELF).ru_maxrss` is a peak value on Darwin, so it cannot
+/// produce meaningful per-input deltas. Mach task info exposes the current
+/// resident set size instead.
+#[cfg(target_os = "macos")]
+fn current_rss_bytes() -> u64 {
+    unsafe extern "C" {
+        #[link_name = "mach_task_self_"]
+        static MACH_TASK_SELF: libc::mach_port_t;
+    }
+
+    unsafe {
+        let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        let kr = libc::task_info(
+            MACH_TASK_SELF,
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        );
+        if kr == libc::KERN_SUCCESS {
+            info.assume_init().resident_size        // TODO lior: this is still the fuzz RSS (which includes the shmem). We should try `info.assume_init().phys_footprint` instead.
+        } else {
+            0                                       // TODO lior: this should panic
+        }
+    }
+}
+
+/// RSS accounting is only implemented for platforms used by this fuzz campaign.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_rss_bytes() -> u64 {
+    panic!("not implemented");
 }
 
 fn main() {
