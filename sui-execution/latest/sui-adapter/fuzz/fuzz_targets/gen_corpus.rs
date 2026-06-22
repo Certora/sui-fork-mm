@@ -15,7 +15,7 @@ extern crate libc;
 
 #[path = "fixture.rs"]
 mod fixture;
-use fixture::{Fixture, run_typing};
+use fixture::{Fixture, PipelineStage, run_typing};
 
 // The .cargo/config.toml injects sancov rustflags for every binary in this crate.
 // gen_corpus doesn't link libafl_targets, so provide no-op stubs for the two
@@ -29,9 +29,11 @@ extern "C" fn __sanitizer_cov_trace_pc_indir(_callee: usize) {}
 
 use sui_types::{
     base_types::{ObjectID, SuiAddress},
+    error::ExecutionErrorTrait,
+    execution_status::ExecutionFailure,
     transaction::{Argument, Command, ProgrammableMoveCall, ProgrammableTransaction},
     type_input::{StructInput, TypeInput},
-    SUI_FRAMEWORK_PACKAGE_ID,
+    MOVE_STDLIB_PACKAGE_ID, SUI_FRAMEWORK_PACKAGE_ID,
 };
 use move_core_types::account_address::AccountAddress;
 
@@ -49,6 +51,43 @@ fn write(dir: &Path, name: &str, ptb: ProgrammableTransaction) {
 
 fn sui_pkg() -> ObjectID {
     SUI_FRAMEWORK_PACKAGE_ID
+}
+
+/// `0x1` — the move-stdlib package present in the framework-only fixture store.
+fn stdlib_pkg() -> ObjectID {
+    MOVE_STDLIB_PACKAGE_ID
+}
+
+/// Address (and package ID) of the synthetic fuzz-fixture package built by the
+/// `Fixture` (see `fixture.rs`). Must match the module address in its source.
+const FUZZ_FIXTURE_ADDRESS: &str = "0xface";
+
+/// Package ID of the fuzz-fixture package.
+fn fuzz_fixture_package_id() -> ObjectID {
+    ObjectID::from_hex_literal(FUZZ_FIXTURE_ADDRESS).expect("valid fixture address")
+}
+
+/// Build a `MoveCall` command against a framework package.
+fn move_call(
+    package: ObjectID,
+    module: &str,
+    function: &str,
+    type_arguments: Vec<TypeInput>,
+    arguments: Vec<Argument>,
+) -> Command {
+    Command::MoveCall(Box::new(ProgrammableMoveCall {
+        package,
+        module: ident(module),
+        function: ident(function),
+        type_arguments,
+        arguments,
+    }))
+}
+
+/// 32 little-endian bytes — the BCS encoding of a `u256` value (the concrete
+/// value is irrelevant; typing only checks the byte length against the type).
+fn u256_bytes() -> Vec<u8> {
+    vec![0u8; 32]
 }
 
 fn ident(s: &str) -> String {
@@ -70,9 +109,10 @@ fn sui_coin_type() -> TypeInput {
     }))
 }
 
-/// Build a `TypeInput::Vector(Vector(…(Bool)…))` nested `depth` levels deep.
+/// Build a `TypeInput::Vector(Vector(…(U64)…))` nested `depth` levels deep.
+/// `depth == 0` yields `U64`, matching a `u64` pure input at the base of the chain.
 fn nested_vector(depth: u32) -> TypeInput {
-    let mut t = TypeInput::Bool;
+    let mut t = TypeInput::U64;
     for _ in 0..depth {
         t = TypeInput::Vector(Box::new(t));
     }
@@ -226,16 +266,25 @@ fn wide_type_args() -> ProgrammableTransaction {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 6 — Pure input at max size (16 KiB), referenced many times
+// Scenario 6 — Pure input at max size (~16 KiB), referenced many times
 //
-// What it stresses: bytes interning (IndexSet growth) and type-inference
-// paths that must re-evaluate the same pure input against different expected
-// types in different commands.
+// A single near-16-KiB pure input (a BCS-encoded `vector<u8>`) is consumed by
+// `n_uses` `MakeMoveVec<vector<u8>>` commands. `vector<u8>` is copyable, so the
+// same input can be referenced by every command, and the resulting
+// `vector<vector<u8>>` is droppable, so the results need not be consumed.
+//
+// What it stresses: bytes interning (IndexSet growth) and the type-inference
+// path that re-evaluates the same large pure input against the same expected
+// type across many commands.
 // ---------------------------------------------------------------------------
 fn max_pure_input_multi_use(n_uses: usize) -> ProgrammableTransaction {
-    let big_bytes = vec![0xABu8; 16 * 1024 - 1]; // just under 16 KiB limit
+    // BCS-encode a Vec<u8> so the pure input is a valid `vector<u8>` value.
+    // The ULEB128 length prefix adds a few bytes, so leave headroom under 16 KiB.
+    let payload = vec![0xABu8; 16 * 1024 - 16];
+    let big_bytes = bcs::to_bytes(&payload).unwrap();
+    let elem_ty = TypeInput::Vector(Box::new(TypeInput::U8));
     let cmds: Vec<Command> = (0..n_uses)
-        .map(|_| Command::MakeMoveVec(Some(TypeInput::U8), vec![Argument::Input(0)]))
+        .map(|_| Command::MakeMoveVec(Some(elem_ty.clone()), vec![Argument::Input(0)]))
         .collect();
     ProgrammableTransaction {
         inputs: vec![sui_types::transaction::CallArg::Pure(big_bytes)],
@@ -244,27 +293,32 @@ fn max_pure_input_multi_use(n_uses: usize) -> ProgrammableTransaction {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 7 — Dense NestedResult cross-references
+// Scenario 7 — Dense NestedResult references to a single source command
 //
-// Many commands, each with NestedResult args pointing back to earlier
-// commands at various (cmd, sub) indices.
+// Command 0 produces a `vector<U64>`; every subsequent command wraps it again
+// via `NestedResult(0, 0)`, producing `vector<vector<U64>>`. Referencing
+// command 0 (rather than chaining through each previous command) keeps the
+// result type bounded — a chained version would nest the vector type `n_cmds`
+// levels deep and exceed the type-depth limit. `vector<U64>` is copyable, so the
+// same sub-result feeds every command, and the droppable results need no
+// consumer.
 //
-// What it stresses: the out-of-bounds path in translate::Context::locations()
-// and NestedResult handling in the typing context.
+// What it stresses: NestedResult sub-index resolution in translate::Context
+// repeated across many commands referencing the same source.
 // ---------------------------------------------------------------------------
 fn nested_result_crossref(n_cmds: usize) -> ProgrammableTransaction {
     let val_bytes = bcs::to_bytes(&1u64).unwrap();
-    let mut cmds = Vec::with_capacity(n_cmds + 1);
-    // Seed: first command produces a result from a pure input.
+    let mut cmds = Vec::with_capacity(n_cmds);
+    // Seed: first command produces a `vector<U64>` from a pure input.
     cmds.push(Command::MakeMoveVec(
         Some(TypeInput::U64),
         vec![Argument::Input(0)],
     ));
-    for i in 1..n_cmds {
-        let base = (i - 1) as u16;
-        // NestedResult(base_cmd, sub_index=0) — always references sub-index 0
-        let args = vec![Argument::NestedResult(base, 0)];
-        cmds.push(Command::MakeMoveVec(Some(TypeInput::U64), args));
+    let wrap_ty = TypeInput::Vector(Box::new(TypeInput::U64));
+    for _ in 1..n_cmds {
+        // Reference command 0's single return value via NestedResult(0, 0).
+        let args = vec![Argument::NestedResult(0, 0)];
+        cmds.push(Command::MakeMoveVec(Some(wrap_ty.clone()), args));
     }
     ProgrammableTransaction {
         inputs: vec![sui_types::transaction::CallArg::Pure(val_bytes)],
@@ -322,17 +376,25 @@ fn minimal_transfer() -> ProgrammableTransaction {
 // Scenario 11 — SplitCoins with many amounts in one command → many NestedResults
 //
 // SplitCoins(GasCoin, [amt]*N) produces N sub-results accessed via NestedResult.
-// None of the original 10 seeds exercise NestedResult(cmd, sub_idx > 0).
+// All N coins are then transferred so the (non-droppable) coins are consumed.
 //
 // What it stresses: multi-return result sub-index handling in translate::Context,
 // NestedResult bounds checking, and the result-type accumulation for wide outputs.
 // ---------------------------------------------------------------------------
 fn split_many_amounts(n: usize) -> ProgrammableTransaction {
     let amt = bcs::to_bytes(&1u64).unwrap();
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
     let amounts = vec![Argument::Input(0); n];
+    let objects: Vec<Argument> = (0..n).map(|i| Argument::NestedResult(0, i as u16)).collect();
     ProgrammableTransaction {
-        inputs: vec![sui_types::transaction::CallArg::Pure(amt)],
-        commands: vec![Command::SplitCoins(Argument::GasCoin, amounts)],
+        inputs: vec![
+            sui_types::transaction::CallArg::Pure(amt),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            Command::SplitCoins(Argument::GasCoin, amounts),
+            Command::TransferObjects(objects, Argument::Input(1)),
+        ],
     }
 }
 
@@ -372,18 +434,25 @@ fn nested_result_fan_in(n: usize) -> ProgrammableTransaction {
 // ...
 //
 // What it stresses: chained mutable-borrow derivation through the coin type;
-// each split consumes the previous result, exercising the linear-borrow
-// tracking in memory_safety.
+// each split derives from the previous result, exercising the linear-borrow
+// tracking in memory_safety. All `depth` derived coins are transferred at the
+// end so the non-droppable coins are consumed.
 // ---------------------------------------------------------------------------
 fn split_chain(depth: usize) -> ProgrammableTransaction {
     let amt = bcs::to_bytes(&1u64).unwrap();
-    let mut cmds = Vec::with_capacity(depth);
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    let mut cmds = Vec::with_capacity(depth + 1);
     for i in 0..depth {
         let src = if i == 0 { Argument::GasCoin } else { Argument::Result((i - 1) as u16) };
         cmds.push(Command::SplitCoins(src, vec![Argument::Input(0)]));
     }
+    let objects: Vec<Argument> = (0..depth).map(|i| Argument::Result(i as u16)).collect();
+    cmds.push(Command::TransferObjects(objects, Argument::Input(1)));
     ProgrammableTransaction {
-        inputs: vec![sui_types::transaction::CallArg::Pure(amt)],
+        inputs: vec![
+            sui_types::transaction::CallArg::Pure(amt),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
         commands: cmds,
     }
 }
@@ -460,7 +529,8 @@ fn merge_split_cycle() -> ProgrammableTransaction {
 // Scenario 16 — Max-width SplitCoins (255 sub-results) + max NestedResult index
 //
 // SplitCoins(GasCoin, [amt]*255) → 255 sub-results (NestedResult(0, 0..254))
-// TransferObjects([NR(0,0), NR(0,254)], addr)  — tests boundary sub-indices
+// TransferObjects([NR(0,0)..NR(0,254)], addr) — consumes every coin, spanning
+// the boundary sub-indices 0 and 254.
 //
 // What it stresses: maximum sub-result index validation (u16 boundary near
 // 255), the result-type Vec capacity for wide single commands.
@@ -469,6 +539,7 @@ fn split_max_width_boundary() -> ProgrammableTransaction {
     let amt  = bcs::to_bytes(&1u64).unwrap();
     let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
     let amounts = vec![Argument::Input(0); 255];
+    let objects: Vec<Argument> = (0..255).map(|i| Argument::NestedResult(0, i as u16)).collect();
     ProgrammableTransaction {
         inputs: vec![
             sui_types::transaction::CallArg::Pure(amt),
@@ -476,11 +547,348 @@ fn split_max_width_boundary() -> ProgrammableTransaction {
         ],
         commands: vec![
             Command::SplitCoins(Argument::GasCoin, amounts),
-            Command::TransferObjects(
-                vec![Argument::NestedResult(0, 0), Argument::NestedResult(0, 254)],
-                Argument::Input(1),
-            ),
+            Command::TransferObjects(objects, Argument::Input(1)),
         ],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 17 — Valid MoveCall with no arguments and no type arguments
+//
+// `0x2::address::length(): u64`. The result is a droppable primitive left
+// unconsumed.
+//
+// What it stresses: the MoveCall loading + typing path itself. Every other
+// Typing-OK seed uses only the built-in commands (Split/Merge/Transfer/
+// MakeMoveVec); this is the first seed that drives a real framework function
+// signature all the way through `translate_and_verify`.
+// ---------------------------------------------------------------------------
+fn move_call_no_args() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![move_call(sui_pkg(), "address", "length", vec![], vec![])],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 18 — MoveCall taking a single pure primitive argument
+//
+// `0x2::address::from_u256(n: u256): address`. A pure `u256` input is bound to
+// the by-value primitive parameter; the `address` result is droppable.
+//
+// What it stresses: pure-input → primitive-parameter binding and type
+// inference inside a MoveCall (a pure input resolved against a function
+// signature rather than a built-in command's expected type).
+// ---------------------------------------------------------------------------
+fn move_call_pure_primitive() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(u256_bytes())],
+        commands: vec![move_call(
+            sui_pkg(),
+            "address",
+            "from_u256",
+            vec![],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 19 — MoveCall taking a pure `vector<u8>` argument
+//
+// `0x1::ascii::string(bytes: vector<u8>): ascii::String`. The pure input is a
+// BCS-encoded `vector<u8>`; the returned `String` is droppable.
+//
+// What it stresses: pure-input → `vector<u8>` parameter binding through a
+// MoveCall, and resolving a framework struct (`ascii::String`) as a result
+// type.
+// ---------------------------------------------------------------------------
+fn move_call_vector_arg() -> ProgrammableTransaction {
+    let bytes = bcs::to_bytes(&vec![0x41u8, 0x42, 0x43]).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bytes)],
+        commands: vec![move_call(
+            stdlib_pkg(),
+            "ascii",
+            "string",
+            vec![],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 20 — MoveCall with a generic type argument and no value arguments
+//
+// `0x1::type_name::get<T>(): TypeName` with `T = 0x2::coin::Coin<0x2::sui::SUI>`.
+// The returned `TypeName` is droppable.
+//
+// What it stresses: generic type-argument substitution / resolution in the
+// loading + typing passes when there are no value arguments to constrain it.
+// ---------------------------------------------------------------------------
+fn move_call_generic_type_arg() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![move_call(
+            stdlib_pkg(),
+            "type_name",
+            "get",
+            vec![sui_coin_type()],
+            vec![],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 21 — MoveCall taking an immutable-reference argument
+//
+// `0x2::hash::keccak256(data: &vector<u8>): vector<u8>`. The pure input is
+// passed by immutable reference; the `vector<u8>` result is droppable.
+//
+// What it stresses: borrow inference for a pure input fed to a `&T` parameter
+// — a distinct typing path from by-value argument binding.
+// ---------------------------------------------------------------------------
+fn move_call_reference_arg() -> ProgrammableTransaction {
+    let bytes = bcs::to_bytes(&vec![0u8; 64]).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bytes)],
+        commands: vec![move_call(
+            sui_pkg(),
+            "hash",
+            "keccak256",
+            vec![],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 22 — Chain of MoveCalls threading each result into the next
+//
+// from_u256(Input) → address; to_u256(R0) → u256; from_u256(R1) → address; …
+// alternating `depth` times. The final result is a droppable primitive.
+//
+// What it stresses: result-type propagation across many MoveCalls — each
+// command's typed return value becomes the next command's argument, exercising
+// the MoveCall result-resolution path repeatedly.
+// ---------------------------------------------------------------------------
+fn move_call_result_chain(depth: usize) -> ProgrammableTransaction {
+    let mut cmds = Vec::with_capacity(depth);
+    cmds.push(move_call(
+        sui_pkg(),
+        "address",
+        "from_u256",
+        vec![],
+        vec![Argument::Input(0)],
+    ));
+    for i in 1..depth {
+        let prev = Argument::Result((i - 1) as u16);
+        // Odd steps consume an `address` (→ u256); even steps consume a `u256`
+        // (→ address), so the argument type always matches the callee.
+        let func = if i % 2 == 1 { "to_u256" } else { "from_u256" };
+        cmds.push(move_call(sui_pkg(), "address", func, vec![], vec![prev]));
+    }
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(u256_bytes())],
+        commands: cmds,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 23 — MoveCall results collected into a typed MakeMoveVec
+//
+// `n` `from_u256` calls each produce an `address`; a final
+// `MakeMoveVec<address>([R0..Rn])` collects them. The resulting
+// `vector<address>` is droppable.
+//
+// What it stresses: feeding MoveCall results into a built-in command's
+// argument list, and result-type accumulation across a wide MakeMoveVec whose
+// elements come from MoveCalls rather than pure inputs.
+// ---------------------------------------------------------------------------
+fn move_call_make_vec_of_results(n: usize) -> ProgrammableTransaction {
+    let mut cmds: Vec<Command> = (0..n)
+        .map(|_| {
+            move_call(
+                sui_pkg(),
+                "address",
+                "from_u256",
+                vec![],
+                vec![Argument::Input(0)],
+            )
+        })
+        .collect();
+    let elems: Vec<Argument> = (0..n).map(|i| Argument::Result(i as u16)).collect();
+    cmds.push(Command::MakeMoveVec(Some(TypeInput::Address), elems));
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(u256_bytes())],
+        commands: cmds,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 24 — MakeMoveVec with inferred element type (None)
+//
+// Two `from_u256` calls produce `address` results; `MakeMoveVec(None, [R0, R1])`
+// then asks typing to infer the element type from its arguments.
+//
+// What it stresses: the element-type *inference* branch of MakeMoveVec typing,
+// which the explicit-`Some(ty)` seeds never reach. This seed deliberately
+// reaches the target with an expected `Err` (not OK): with no annotation,
+// MakeMoveVec requires every argument to be the *same object type* (a type with
+// `key`), and `address` is not an object — so it exercises both the inference
+// branch and its object-type validation/error path inside
+// `translate_and_verify`. A would-be valid version (a vector of `Coin<SUI>`)
+// can't be expressed here because no built-in command can consume the resulting
+// non-droppable `vector<Coin>`.
+// ---------------------------------------------------------------------------
+fn make_move_vec_none_infer() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(u256_bytes())],
+        commands: vec![
+            move_call(
+                sui_pkg(),
+                "address",
+                "from_u256",
+                vec![],
+                vec![Argument::Input(0)],
+            ),
+            move_call(
+                sui_pkg(),
+                "address",
+                "from_u256",
+                vec![],
+                vec![Argument::Input(0)],
+            ),
+            Command::MakeMoveVec(None, vec![Argument::Result(0), Argument::Result(1)]),
+        ],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 25 — Empty typed MakeMoveVec (zero elements)
+//
+// `MakeMoveVec<u64>([])` produces an empty `vector<u64>`, which is droppable.
+//
+// What it stresses: the zero-argument branch of MakeMoveVec typing, where the
+// element type comes entirely from the explicit annotation with nothing to
+// unify against.
+// ---------------------------------------------------------------------------
+fn make_move_vec_empty_typed() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![Command::MakeMoveVec(Some(TypeInput::U64), vec![])],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios 26–32 — Calls into the synthetic fuzz-fixture package (`0xface`)
+//
+// Unlike the framework `MoveCall` seeds, these target a purpose-built package
+// (defined in fixture.rs) whose functions span primitives, vectors, references,
+// generics with ability bounds, structs, and multiple returns. They drive the
+// MoveCall typing path through a controllable, resolvable target.
+// ---------------------------------------------------------------------------
+
+/// `0xface::fuzz_fixture::<function>(...)`.
+fn fixture_call(
+    function: &str,
+    type_arguments: Vec<TypeInput>,
+    arguments: Vec<Argument>,
+) -> Command {
+    move_call(
+        fuzz_fixture_package_id(),
+        "fuzz_fixture",
+        function,
+        type_arguments,
+        arguments,
+    )
+}
+
+// Scenario 26 — fixture call with no arguments or type arguments (`nothing()`).
+fn fixture_no_args() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![fixture_call("nothing", vec![], vec![])],
+    }
+}
+
+// Scenario 27 — fixture call taking a pure primitive (`take_u64(u64)`).
+fn fixture_take_primitive() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&7u64).unwrap(),
+        )],
+        commands: vec![fixture_call("take_u64", vec![], vec![Argument::Input(0)])],
+    }
+}
+
+// Scenario 28 — struct round-trip: `new_box(u64) -> Box`, then `unbox(Box) -> u64`.
+// Exercises a user-defined struct flowing as a MoveCall result into another call.
+fn fixture_struct_roundtrip() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&1u64).unwrap(),
+        )],
+        commands: vec![
+            fixture_call("new_box", vec![], vec![Argument::Input(0)]),
+            fixture_call("unbox", vec![], vec![Argument::Result(0)]),
+        ],
+    }
+}
+
+// Scenario 29 — generic identity (`identity<u64>(u64) -> u64`).
+// Exercises generic substitution where the type argument is fixed and a pure
+// input must unify against the type parameter.
+fn fixture_generic_identity() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&123u64).unwrap(),
+        )],
+        commands: vec![fixture_call(
+            "identity",
+            vec![TypeInput::U64],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// Scenario 30 — multiple-return MoveCall consumed via NestedResult.
+// `two_values() -> (u64, bool)`, then each component is fed into a separate call.
+fn fixture_multi_return() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![
+            fixture_call("two_values", vec![], vec![]),
+            fixture_call("take_u64", vec![], vec![Argument::NestedResult(0, 0)]),
+            fixture_call("take_bool", vec![], vec![Argument::NestedResult(0, 1)]),
+        ],
+    }
+}
+
+// Scenario 31 — generic struct constructor with ability bounds
+// (`make_pair<u64>(u64, u64) -> Pair<u64>`). The copyable pure input is reused
+// for both arguments; the droppable `Pair<u64>` result is left unconsumed.
+fn fixture_make_pair() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&9u64).unwrap(),
+        )],
+        commands: vec![fixture_call(
+            "make_pair",
+            vec![TypeInput::U64],
+            vec![Argument::Input(0), Argument::Input(0)],
+        )],
+    }
+}
+
+// Scenario 32 — immutable-reference parameter (`use_imm_ref(&u64) -> u64`).
+// Exercises borrow inference for a pure input passed to a user function's `&T`.
+fn fixture_reference_arg() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&5u64).unwrap(),
+        )],
+        commands: vec![fixture_call("use_imm_ref", vec![], vec![Argument::Input(0)])],
     }
 }
 
@@ -494,9 +902,8 @@ fn empty_ptb() -> ProgrammableTransaction {
     }
 }
 
-/// Returns current process RSS in bytes by reading `VmRSS` from `/proc/self/status`.
-/// Unlike `getrusage(RUSAGE_SELF).ru_maxrss` (which is a peak-ever value on Linux),
-/// this reflects the live working-set size and produces a meaningful delta.
+/// Returns current process RSS in bytes.
+#[cfg(target_os = "linux")]
 fn current_rss_bytes() -> u64 {
     fs::read_to_string("/proc/self/status")
         .ok()
@@ -508,6 +915,76 @@ fn current_rss_bytes() -> u64 {
         })
         .unwrap_or(0)
         * 1024 // value is in kB
+}
+
+/// Returns current process RSS in bytes.
+///
+/// `getrusage(RUSAGE_SELF).ru_maxrss` is a peak value on Darwin, so it cannot
+/// produce meaningful per-input deltas. Mach task info exposes the current
+/// resident set size instead.
+#[cfg(target_os = "macos")]
+fn current_rss_bytes() -> u64 {
+    unsafe extern "C" {
+        #[link_name = "mach_task_self_"]
+        static MACH_TASK_SELF: libc::mach_port_t;
+    }
+
+    unsafe {
+        let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        let kr = libc::task_info(
+            MACH_TASK_SELF,
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
+        );
+        if kr == libc::KERN_SUCCESS {
+            info.assume_init().resident_size
+        } else {
+            0
+        }
+    }
+}
+
+/// RSS accounting is only implemented for platforms used by this fuzz campaign.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_rss_bytes() -> u64 {
+    0
+}
+
+enum ValidationOutcome {
+    BcsFailed(String),
+    Typed {
+        stage: PipelineStage,
+        result: Result<(), ExecutionFailure>,
+    },
+}
+
+fn format_validation(outcome: &ValidationOutcome) -> (String, String) {
+    match outcome {
+        ValidationOutcome::BcsFailed(err) => ("—".into(), format!("BCS decode failed: {err}")),
+        ValidationOutcome::Typed { stage, result: Ok(()) } => {
+            (format!("{stage:?}"), "OK".into())
+        }
+        ValidationOutcome::Typed { stage, result: Err(err) } => {
+            let mut msg = err.to_string();
+            if let Some(cmd) = err.command() {
+                msg.push_str(&format!(" (command {cmd})"));
+            }
+            (format!("{stage:?}"), msg)
+        }
+    }
+}
+
+fn print_validation_report(entries: &[(String, ValidationOutcome, u64)]) {
+    println!("Pipeline validation (`run_typing` per corpus file):\n");
+    println!("{:<42} {:>8}  outcome", "file", "stage");
+    println!("{}", "-".repeat(90));
+    for (name, outcome, _) in entries {
+        let (stage, msg) = format_validation(outcome);
+        println!("{name:<42} {stage:>8}  {msg}");
+    }
+    println!();
 }
 
 fn main() {
@@ -530,41 +1007,62 @@ fn main() {
     write(dir, "14_make_vec_primitives", make_vec_primitives());
     write(dir, "15_merge_split_cycle", merge_split_cycle());
     write(dir, "16_split_max_width_boundary", split_max_width_boundary());
+    write(dir, "17_move_call_no_args", move_call_no_args());
+    write(dir, "18_move_call_pure_primitive", move_call_pure_primitive());
+    write(dir, "19_move_call_vector_arg", move_call_vector_arg());
+    write(dir, "20_move_call_generic_type_arg", move_call_generic_type_arg());
+    write(dir, "21_move_call_reference_arg", move_call_reference_arg());
+    write(dir, "22_move_call_result_chain_64", move_call_result_chain(64));
+    write(dir, "23_move_call_make_vec_of_results_64", move_call_make_vec_of_results(64));
+    write(dir, "24_make_move_vec_none_infer", make_move_vec_none_infer());
+    write(dir, "25_make_move_vec_empty_typed", make_move_vec_empty_typed());
+    write(dir, "26_fixture_no_args", fixture_no_args());
+    write(dir, "27_fixture_take_primitive", fixture_take_primitive());
+    write(dir, "28_fixture_struct_roundtrip", fixture_struct_roundtrip());
+    write(dir, "29_fixture_generic_identity", fixture_generic_identity());
+    write(dir, "30_fixture_multi_return", fixture_multi_return());
+    write(dir, "31_fixture_make_pair", fixture_make_pair());
+    write(dir, "32_fixture_reference_arg", fixture_reference_arg());
 
     println!("\nCorpus ready in ./corpus/\n");
 
-    // ── Calibration ──────────────────────────────────────────────────────────
-    // Run each corpus file through the real typing pipeline and measure the RSS
-    // delta.  This gives an empirical baseline for RSS_DELTA_LIMIT_BYTES in the
-    // fuzzer harness rather than an arbitrary guess.
-    println!("Calibrating RSS delta per corpus file (building fixture — may take a moment)...\n");
+    // Run each corpus file through the real typing pipeline: report stage + error,
+    // then measure RSS delta for RSS_DELTA_LIMIT_BYTES calibration.
+    println!("Validating corpus and calibrating RSS (building fixture — may take a moment)...\n");
 
     let fixture = Fixture::new();
 
-    let mut entries: Vec<(String, u64)> = fs::read_dir(dir)
+    let mut entries: Vec<(String, ValidationOutcome, u64)> = fs::read_dir(dir)
         .expect("failed to read corpus/")
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |x| x == "bin"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
         .map(|e| {
             let path = e.path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let bytes = fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
 
             let rss_before = current_rss_bytes();
-            if let Ok(ptb) = bcs::from_bytes::<sui_types::transaction::ProgrammableTransaction>(&bytes) {
-                let (_, _) = run_typing(&fixture, ptb);
-            }
+            let outcome = match bcs::from_bytes::<ProgrammableTransaction>(&bytes) {
+                Err(err) => ValidationOutcome::BcsFailed(err.to_string()),
+                Ok(ptb) => {
+                    let (stage, result) = run_typing(&fixture, ptb);
+                    ValidationOutcome::Typed { stage, result }
+                }
+            };
             let delta = current_rss_bytes().saturating_sub(rss_before);
-            (name, delta)
+            (name, outcome, delta)
         })
         .collect();
 
-    entries.sort_by_key(|(name, _)| name.clone());
+    entries.sort_by_key(|(name, _, _)| name.clone());
 
+    print_validation_report(&entries);
+
+    println!("RSS delta per corpus file:\n");
     println!("{:<45} {:>12}", "file", "RSS delta");
     println!("{}", "-".repeat(59));
     let mut max_delta: u64 = 0;
-    for (name, delta) in &entries {
+    for (name, _, delta) in &entries {
         println!("{:<45} {:>9} KiB", name, delta / 1024);
         max_delta = max_delta.max(*delta);
     }
