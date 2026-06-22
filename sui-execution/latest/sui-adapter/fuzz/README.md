@@ -48,14 +48,14 @@ cd /path/to/fuzz-test
 > `x86_64-apple-darwin` for Intel Macs.  Update the binary path in the copy
 > command above accordingly.
 
-### Re-calibrating the RSS threshold (recommended before a full campaign)
+### Re-calibrating the heap threshold (recommended before a full campaign)
 
-The compile-time constant `RSS_DELTA_LIMIT_BYTES` is a seed-based estimate
+The compile-time constant `HEAP_DELTA_LIMIT_BYTES` is a seed-based estimate
 (5× the worst corpus seed).  Tighten it against real fuzz traffic in two steps:
 
 **Step 0 — verify the typing pass is being reached**
 
-Before collecting RSS deltas it is worth confirming that fuzz inputs are
+Before collecting heap deltas it is worth confirming that fuzz inputs are
 actually reaching `typing::translate_and_verify` and not failing earlier (e.g.
 at linkage because they reference packages absent from the fixture store).
 
@@ -78,26 +78,26 @@ before a full campaign is worthwhile.
 timeout 10m ./translate_and_verify --record-deltas
 ```
 
-Appends one RSS-delta value per iteration to `./rss_deltas.log`.
+Appends one heap-delta value per iteration to `./heap_deltas.log`.
 
 **Step 2 — apply the derived threshold**
 
 ```sh
-./translate_and_verify --rss-threshold-from rss_deltas.log
+./translate_and_verify --heap-threshold-from heap_deltas.log
 ```
 
-Reads `rss_deltas.log`, computes p99.9 × 1.5 (rounded up to the nearest MiB),
+Reads `heap_deltas.log`, computes p99.9 × 1.5 (rounded up to the nearest MiB),
 prints the derived value to stderr, and uses it as the runtime limit for this
 run — no source edit required.  Both flags can be combined to record and apply
 simultaneously:
 
 ```sh
-./translate_and_verify --record-deltas --rss-threshold-from rss_deltas.log
+./translate_and_verify --record-deltas --heap-threshold-from heap_deltas.log
 ```
 
-After calibration, pass `--rss-threshold-from rss_deltas.log` on every run to
+After calibration, pass `--heap-threshold-from heap_deltas.log` on every run to
 apply the derived threshold automatically.  If you want to bake the value in
-permanently, update `RSS_DELTA_LIMIT_BYTES` in `translate_and_verify.rs` and
+permanently, update `HEAP_DELTA_LIMIT_BYTES` in `translate_and_verify.rs` and
 rebuild.
 
 Interesting corpus entries accumulate in `./corpus/`.
@@ -108,7 +108,7 @@ Crashes and timeouts are saved to `./crashes/`.
 ## Triaging the crashes directory
 
 After a campaign the `./crashes/` directory contains every input that triggered
-the objective (crash, timeout, or RSS overage) with a unique backtrace hash.
+the objective (crash, timeout, or heap overage) with a unique backtrace hash.
 Not all of them are real bugs.  Use the `replay` binary to distinguish genuine
 findings from noise quickly.
 
@@ -142,10 +142,10 @@ e101a7f8bedac268                                             1260376  typing_ok 
 | Column | Meaning |
 |--------|---------|
 | `stage` | Where the pipeline stopped: `decode_fail` (BCS parse error), `linkage_fail`, `loading_fail`, or `typing_ok` (reached and completed translate_and_verify) |
-| `anon_rss∆` | Net change in anonymous RSS (heap + stack) over the iteration — a proxy for per-input allocation |
+| `heap∆` | Net change in jemalloc `stats.allocated` over the iteration — exact bytes allocated and not freed by the harness closure |
 | `wall_ms` | Wall-clock time for the iteration |
 | `*** PANIC ***` | The input triggered a panic or `invariant_violation!` — a real finding |
-| `*** RSS ***` | `anon_rss∆` exceeded 62 MiB — a potential OOM finding |
+| `*** HEAP ***` | `heap∆` exceeded 62 MiB — a potential OOM finding |
 
 **What to look for:**
 
@@ -154,8 +154,8 @@ e101a7f8bedac268                                             1260376  typing_ok 
   RUST_BACKTRACE=1 ./replay crashes/<hash>
   ```
 - Lines where `stage = decode_fail` or `loading_fail` are almost certainly false positives — the input never reached the target.
-- `typing_ok` with low `anon_rss∆` and short `wall_ms` that re-runs cleanly indicates the objective was triggered by RSS baseline drift during a long in-process campaign (see below). These are not findings.
-- High `anon_rss∆` values on `typing_ok` inputs that don't panic are worth investigating: they indicate the typing pass allocates pathologically on certain input shapes even without crashing.
+- `typing_ok` with low `heap∆` and short `wall_ms` that re-runs cleanly indicates the objective was triggered by baseline drift in a previous campaign that used OS-level RSS metrics. These are not findings.
+- High `heap∆` values on `typing_ok` inputs that don't panic are worth investigating: they indicate the typing pass allocates pathologically on certain input shapes even without crashing.
 
 **Prioritisation:**
 
@@ -163,45 +163,34 @@ e101a7f8bedac268                                             1260376  typing_ok 
 # Panics first
 ./replay crashes/ | grep 'PANIC'
 
-# Then large anon RSS on typing_ok inputs
+# Then large heap allocation on typing_ok inputs
 ./replay crashes/ | awk '$3=="typing_ok" {gsub(/MiB/,""); if ($4+0 > 20) print}' | sort -k4 -rn
 
 # Ignore decode_fail and loading_fail entirely
 ./replay crashes/ | grep -v 'decode_fail\|loading_fail'
 ```
 
-### Known false-positive pattern: RSS baseline drift
+### Known false-positive pattern: OS-level RSS drift
 
-`InProcessExecutor` runs the harness in the same process across all iterations.
-Over a long campaign the process RSS grows steadily: the corpus accumulates in
-memory, LibAFL's shared-memory edge map and backtrace observer expand, and the
-Rust allocator's free lists grow.
+Earlier versions of the harness measured `VmRSS` or `RssAnon` from
+`/proc/self/status`.  Both are OS-level resident-page counts with two
+fundamental problems as per-input allocation signals:
 
-The harness measures the RSS delta within the harness closure — `rss_before` at
-entry, `rss_after` at exit.  LibAFL's per-iteration allocations (input
-selection, mutation, corpus updates, feedback evaluation) run outside the
-closure and are therefore excluded from the delta window.  What the metric
-captures is: BCS deserialization + `run_typing` allocations + any allocator
-free-list growth caused by those calls.
+- **Page granularity**: RSS only changes in 4 KiB increments. Allocations that
+  land in already-resident pages show as zero delta even if the harness
+  allocated many megabytes.
+- **Free-list masking**: the allocator retains freed pages in its free list
+  rather than returning them to the OS immediately. After a large allocation is
+  freed the RSS stays elevated, making the *next* iteration's baseline higher
+  than expected and its delta appear negative or near-zero.
 
-The metric is `RssAnon` (private anonymous pages) rather than `VmRSS`.
-`VmRSS = RssAnon + RssFile + RssShmem`; the file-backed and shared-memory
-components fluctuate with kernel paging activity and accumulate with LibAFL's
-own shared-memory segments independently of anything the input causes.
-`RssAnon` eliminates those two components.  It does not give a perfectly
-isolated view of harness-only allocations — `RssAnon` covers the entire
-process's anonymous heap, including LibAFL's own heap footprint — but the
-delta is tightly scoped to the closure, so LibAFL's steady-state allocations
-cancel out in the subtraction.  Residual drift comes from the Rust allocator
-retaining freed memory in its free lists rather than returning pages to the OS;
-this is much slower than the shared-memory accumulation that made `VmRSS`
-unusable, but it can still inflate deltas in very long campaigns.
+Over a 22-hour campaign these effects accumulated into hundreds of false-positive
+objectives: inputs whose `VmRSS` delta exceeded the threshold during the run
+but showed near-zero allocation on replay.
 
-On macOS, `RssAnon` is not available.  The macOS implementation uses Mach task
-info `resident_size`, which is closer to `VmRSS` than `RssAnon` in that it
-includes shared library pages.  `phys_footprint` (also from Mach task info)
-would be a better proxy for anonymous allocations on macOS but has not been
-validated yet — the relevant TODO is in `translate_and_verify.rs`.
+The harness now uses jemalloc `stats.allocated` instead, which measures exact
+bytes handed out by the allocator and not yet freed — no page granularity, no
+free-list masking, and no shared-memory contamination.
 
 ---
 
@@ -329,7 +318,7 @@ OOM isolation is provided by `setrlimit(RLIMIT_AS, 4 GiB)` set at startup.
 When an input exhausts virtual address space, `mmap` returns `ENOMEM`, Rust's
 allocator calls `abort()`, and LibAFL's in-process `SIGABRT` handler catches
 the signal as `ExitKind::Crash`, saves the input to `./crashes/`, and continues
-fuzzing.  The 4 GiB ceiling is well above any legitimate PTB; the RSS delta
+fuzzing.  The 4 GiB ceiling is well above any legitimate PTB; the heap delta
 guard provides the finer-grained signal for moderate over-allocation.
 
 > **Why not `InProcessForkExecutor`?**  Fork-based execution isolates each
@@ -351,30 +340,31 @@ dependency crates, and `MaxMapFeedback` saturates in the first minute.  With
 scoping, only the typing pipeline is instrumented (~8681 edges), making every
 new branch in `translate_and_verify` a genuine corpus event.
 
-### RSS delta guard
+### Heap allocation guard
 
-An RSS delta guard reads the current RSS before and after each harness call.
-Any input whose delta exceeds `RSS_DELTA_LIMIT_BYTES` is treated as a crash and
-saved to `./crashes/`.
+A heap delta guard reads `jemalloc`'s `stats.allocated` counter before and
+after each harness call.  Any input whose net allocation exceeds
+`HEAP_DELTA_LIMIT_BYTES` is treated as a crash and saved to `./crashes/`.
 
-**Linux:** uses `RssAnon` from `/proc/self/status`.  `RssAnon` covers only
-private anonymous pages (heap + stack), excluding file-backed pages (`RssFile`)
-and shared-memory segments (`RssShmem`) that fluctuate with kernel paging
-activity and accumulate with LibAFL's own shared-memory structures over a long
-in-process run.  `RssAnon` is not a perfectly isolated view of harness-only
-allocations — the full process anonymous heap is measured, not just
-`run_typing`'s heap — but the delta is scoped within the harness closure, so
-LibAFL's steady-state allocations cancel out in the subtraction.  Residual
-drift comes from the Rust allocator retaining freed pages in its free lists,
-but this is much slower than the `VmRSS` drift that afflicted earlier runs.
+`stats.allocated` is the number of bytes currently handed out by jemalloc and
+not yet freed, summed across **all arenas and all threads**.  It is
+fundamentally different from OS-level RSS metrics:
 
-**macOS:** uses Mach task info `resident_size`, which is closer to `VmRSS`
-than `RssAnon` (it includes shared library pages).  `phys_footprint` would be
-a better proxy but has not been validated yet — see the TODO in
-`translate_and_verify.rs`.
+- No page-granularity noise (RSS only moves in 4 KiB increments; jemalloc
+  reports exact bytes).
+- No free-list masking (RSS stays high after free because the OS hasn't
+  reclaimed the pages; `stats.allocated` drops immediately when memory is
+  freed).
+- No shared-memory or file-backed page contamination.
+- Covers all threads, not just the main arena (`mallinfo2` only covers the
+  main arena, missing per-thread arenas created under lock contention).
+
+`epoch::advance()` is called before each read to flush jemalloc's per-thread
+caches into the global counters; without this the read may be stale by up to
+one cache flush interval.
 
 The threshold is set empirically: `gen_corpus` runs each seed through the real
 pipeline, reports the delta per file, and suggests **5× the worst-case observed
 value**.  As of the current seed set the worst case is
 `04_make_move_vec_fan_out_255` at ~12.3 MiB, giving a threshold of **62 MiB**.
-Re-calibrate with `--rss-threshold-from` after a ~10-minute warm-up run.
+Re-calibrate with `--heap-threshold-from` after a ~10-minute warm-up run.

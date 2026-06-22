@@ -46,8 +46,12 @@ use libafl_bolts::{
     tuples::tuple_list,
 };
 use libafl_targets::std_edges_map_observer;
+use tikv_jemalloc_ctl::{epoch, stats};
 
 use sui_types::transaction::ProgrammableTransaction;
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[path = "fixture.rs"]
 mod fixture;
@@ -69,70 +73,40 @@ thread_local! {
 // Set once in main before any fork; read in the child from its copy of the address space.
 static RECORD_STAGES: AtomicBool = AtomicBool::new(false);
 static RECORD_DELTAS: AtomicBool = AtomicBool::new(false);
-static RSS_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static HEAP_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static STAGES_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static DELTAS_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Any single iteration that allocates more than this is a finding regardless of whether
-/// it panics.  Set to 5× the worst-case corpus seed as measured by `gen_corpus` calibration
+/// Any single iteration that keeps more than this many bytes allocated (as reported by
+/// jemalloc `stats.allocated`) is a finding regardless of whether it panics.
+/// Set to 5× the worst-case corpus seed as measured by `gen_corpus` calibration
 /// (04_make_move_vec_fan_out_255 → ~12.3 MiB → 62 MiB threshold).
 /// Re-run `gen_corpus` after adding new seeds, and re-calibrate against the actual
-/// RSS-delta distribution after a ~10-minute warm-up run.
-const RSS_DELTA_LIMIT_BYTES: u64 = 62 * 1024 * 1024;
+/// heap-delta distribution after a ~10-minute warm-up run.
+const HEAP_DELTA_LIMIT_BYTES: u64 = 62 * 1024 * 1024;
 
-/// Returns the process's anonymous RSS in bytes from `/proc/self/status` (RssAnon).
+/// Returns the number of bytes currently allocated by jemalloc across all arenas
+/// and all threads.
 ///
-/// `VmRSS` includes file-backed and shared-memory pages that the kernel pages in/out
-/// independently of anything the harness allocates — it produces noisy deltas over a
-/// long run.  `RssAnon` covers only private anonymous mappings (heap + stack), so its
-/// delta directly reflects allocations made by the harness during a single iteration.
-#[cfg(target_os = "linux")]
-fn current_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("RssAnon:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u64>().ok())
-        })
-        .unwrap_or(0)       // TODO gco: this should panic
-        * 1024 // value is in kB
-}
-
-/// Returns current process RSS in bytes.
+/// jemalloc's `stats.allocated` is the authoritative per-input allocation signal:
+/// it counts bytes handed out by the allocator and not yet freed, regardless of
+/// whether the OS has paged those bytes in.  Unlike OS-level RSS metrics it is not
+/// affected by page granularity (4 KiB floor), kernel paging decisions, shared-memory
+/// segments, or free-list retention — the delta between two reads is exactly the net
+/// heap bytes kept alive by the harness closure.
 ///
-/// `getrusage(RUSAGE_SELF).ru_maxrss` is a peak value on Darwin, so it cannot
-/// produce meaningful per-input deltas. Mach task info exposes the current
-/// resident set size instead.
-#[cfg(target_os = "macos")]
-fn current_rss_bytes() -> u64 {
-    unsafe extern "C" {
-        #[link_name = "mach_task_self_"]
-        static MACH_TASK_SELF: libc::mach_port_t;
-    }
-
-    unsafe {
-        let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
-        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
-        let kr = libc::task_info(
-            MACH_TASK_SELF,
-            libc::MACH_TASK_BASIC_INFO,
-            info.as_mut_ptr().cast::<libc::integer_t>(),
-            &mut count,
-        );
-        if kr == libc::KERN_SUCCESS {
-            info.assume_init().resident_size        // TODO lior: this is still the fuzz RSS (which includes the shmem). We should try `info.assume_init().phys_footprint` instead.
-        } else {
-            0                                       // TODO lior: this should panic
-        }
-    }
-}
-
-/// RSS accounting is only implemented for platforms used by this fuzz campaign.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn current_rss_bytes() -> u64 {
-    panic!("not implemented");
+/// Calling `epoch::mib().advance()` first forces jemalloc to flush its per-thread
+/// caches into the global stats counters; without this the read may be stale.
+fn current_heap_bytes() -> u64 {
+    // Advancing the epoch flushes per-thread cache into the global stats.
+    epoch::mib()
+        .expect("jemalloc epoch mib")
+        .advance()
+        .expect("jemalloc epoch advance");
+    stats::allocated::mib()
+        .expect("jemalloc allocated mib")
+        .read()
+        .expect("jemalloc allocated read") as u64
 }
 
 /// Read a deltas log (one u64 byte-count per line) and return the p99.9 value × 1.5,
@@ -155,7 +129,7 @@ fn threshold_from_log(path: &str) -> u64 {
         .div_ceil(1024 * 1024)
         * 1024 * 1024;
     eprintln!(
-        "[rss-threshold] log={path}  n={}  p99.9={} KiB  threshold={} MiB",
+        "[heap-threshold] log={path}  n={}  p99.9={} KiB  threshold={} MiB",
         vals.len(),
         p999 / 1024,
         threshold / (1024 * 1024),
@@ -175,41 +149,38 @@ fn main() -> Result<(), libafl::Error> {
     let mut args = std::env::args().peekable();
     let mut record_deltas = false;
     let mut record_stages = false;
-    let mut rss_threshold_log: Option<String> = None;
+    let mut heap_threshold_log: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--record-deltas" => record_deltas = true,
             "--record-stages" => record_stages = true,
-            "--rss-threshold-from" => {
-                rss_threshold_log = Some(
-                    args.next().expect("--rss-threshold-from requires a path argument"),
+            "--heap-threshold-from" => {
+                heap_threshold_log = Some(
+                    args.next().expect("--heap-threshold-from requires a path argument"),
                 );
             }
             _ => {}
         }
     }
 
-    let rss_limit = match rss_threshold_log {
+    let heap_limit = match heap_threshold_log {
         Some(ref path) => threshold_from_log(path),
-        None => RSS_DELTA_LIMIT_BYTES,
+        None => HEAP_DELTA_LIMIT_BYTES,
     };
 
     let corpus_dir   = bin_dir.join("corpus");
     let crashes_dir  = bin_dir.join("crashes");
     let stages_log   = bin_dir.join("pipeline_stages.log");
-    let deltas_log   = bin_dir.join("rss_deltas.log");
+    let deltas_log   = bin_dir.join("heap_deltas.log");
 
-    // Store flags and limit in globals so the forked child can read them from
-    // its copy of the address space — closure captures are parent-stack references
-    // and are not accessible after fork.
     RECORD_DELTAS.store(record_deltas, Ordering::Relaxed);
     RECORD_STAGES.store(record_stages, Ordering::Relaxed);
-    RSS_LIMIT.store(rss_limit, Ordering::Relaxed);
+    HEAP_LIMIT.store(heap_limit, Ordering::Relaxed);
     STAGES_LOG_PATH.set(stages_log.clone()).ok();
     DELTAS_LOG_PATH.set(deltas_log.clone()).ok();
 
     if record_deltas {
-        eprintln!("[record-deltas] appending RSS deltas to {}", deltas_log.display());
+        eprintln!("[record-deltas] appending heap deltas to {}", deltas_log.display());
     }
     if record_stages {
         eprintln!("[record-stages] appending pipeline stages to {}", stages_log.display());
@@ -218,7 +189,7 @@ fn main() -> Result<(), libafl::Error> {
     // The closure run on each input (executes in the forked child).
     // Flags and limits are read from globals set before the first fork.
     let mut harness = |input: &BytesInput| {
-        let rss_before = current_rss_bytes();
+        let heap_before = current_heap_bytes();
         let bytes = input.target_bytes();
         let decode_result = bcs::from_bytes::<ProgrammableTransaction>(bytes.as_slice());
         let stage_byte = match decode_result {
@@ -244,18 +215,18 @@ fn main() -> Result<(), libafl::Error> {
                 }
             }
         }
-        let rss_delta = current_rss_bytes().saturating_sub(rss_before);
+        let heap_delta = current_heap_bytes().saturating_sub(heap_before);
         if RECORD_DELTAS.load(Ordering::Relaxed) {
             if let Some(path) = DELTAS_LOG_PATH.get() {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true).append(true).open(path)
                 {
-                    let _ = writeln!(f, "{rss_delta}");
+                    let _ = writeln!(f, "{heap_delta}");
                 }
             }
         }
         // Report as a crash if this input caused anomalous allocation.
-        if rss_delta > RSS_LIMIT.load(Ordering::Relaxed) {
+        if heap_delta > HEAP_LIMIT.load(Ordering::Relaxed) {
             return ExitKind::Crash;
         }
         ExitKind::Ok
@@ -348,7 +319,7 @@ fn main() -> Result<(), libafl::Error> {
     // ENOMEM → allocator abort → SIGABRT, which LibAFL's in-process signal handler
     // catches as ExitKind::Crash.  Without this limit an OOM would SIGKILL the
     // entire fuzzer process.  4 GiB is well above any legitimate PTB; the corpus
-    // calibration threshold (RSS_DELTA_LIMIT_BYTES / --rss-threshold-from) provides
+    // calibration threshold (HEAP_DELTA_LIMIT_BYTES / --heap-threshold-from) provides
     // the finer-grained signal for moderate over-allocation.
     unsafe {
         let limit = 4u64 * 1024 * 1024 * 1024;

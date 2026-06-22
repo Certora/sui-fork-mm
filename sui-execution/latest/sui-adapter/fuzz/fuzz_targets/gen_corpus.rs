@@ -11,7 +11,10 @@
 
 use std::{fs, path::Path};
 
-extern crate libc;
+use tikv_jemalloc_ctl::{epoch, stats};
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[path = "fixture.rs"]
 mod fixture;
@@ -902,59 +905,15 @@ fn empty_ptb() -> ProgrammableTransaction {
     }
 }
 
-/// Returns the process's anonymous RSS in bytes from `/proc/self/status` (RssAnon).
-///
-/// `VmRSS` includes file-backed and shared-memory pages that the kernel pages in/out
-/// independently of anything the harness allocates — it produces noisy deltas over a
-/// long run.  `RssAnon` covers only private anonymous mappings (heap + stack), so its
-/// delta directly reflects allocations made by the harness during a single iteration.
-#[cfg(target_os = "linux")]
-fn current_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("RssAnon:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u64>().ok())
-        })
-        .unwrap_or(0)       // TODO gco: this should panic
-        * 1024 // value is in kB
-}
-
-/// Returns current process RSS in bytes.
-///
-/// `getrusage(RUSAGE_SELF).ru_maxrss` is a peak value on Darwin, so it cannot
-/// produce meaningful per-input deltas. Mach task info exposes the current
-/// resident set size instead.
-#[cfg(target_os = "macos")]
-fn current_rss_bytes() -> u64 {
-    unsafe extern "C" {
-        #[link_name = "mach_task_self_"]
-        static MACH_TASK_SELF: libc::mach_port_t;
-    }
-
-    unsafe {
-        let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info_data_t>::uninit();
-        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
-        let kr = libc::task_info(
-            MACH_TASK_SELF,
-            libc::MACH_TASK_BASIC_INFO,
-            info.as_mut_ptr().cast::<libc::integer_t>(),
-            &mut count,
-        );
-        if kr == libc::KERN_SUCCESS {
-            info.assume_init().resident_size        // TODO lior: this is still the fuzz RSS (which includes the shmem). We should try `info.assume_init().phys_footprint` instead.
-        } else {
-            0                                       // TODO lior: this should panic
-        }
-    }
-}
-
-/// RSS accounting is only implemented for platforms used by this fuzz campaign.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn current_rss_bytes() -> u64 {
-    panic!("not implemented");
+fn current_heap_bytes() -> u64 {
+    epoch::mib()
+        .expect("jemalloc epoch mib")
+        .advance()
+        .expect("jemalloc epoch advance");
+    stats::allocated::mib()
+        .expect("jemalloc allocated mib")
+        .read()
+        .expect("jemalloc allocated read") as u64
 }
 
 enum ValidationOutcome {
@@ -1032,8 +991,8 @@ fn main() {
     println!("\nCorpus ready in ./corpus/\n");
 
     // Run each corpus file through the real typing pipeline: report stage + error,
-    // then measure RSS delta for RSS_DELTA_LIMIT_BYTES calibration.
-    println!("Validating corpus and calibrating RSS (building fixture — may take a moment)...\n");
+    // then measure heap delta for HEAP_DELTA_LIMIT_BYTES calibration.
+    println!("Validating corpus and calibrating heap threshold (building fixture — may take a moment)...\n");
 
     let fixture = Fixture::new();
 
@@ -1046,7 +1005,7 @@ fn main() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let bytes = fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
 
-            let rss_before = current_rss_bytes();
+            let heap_before = current_heap_bytes();
             let outcome = match bcs::from_bytes::<ProgrammableTransaction>(&bytes) {
                 Err(err) => ValidationOutcome::BcsFailed(err.to_string()),
                 Ok(ptb) => {
@@ -1054,7 +1013,7 @@ fn main() {
                     ValidationOutcome::Typed { stage, result }
                 }
             };
-            let delta = current_rss_bytes().saturating_sub(rss_before);
+            let delta = current_heap_bytes().saturating_sub(heap_before);
             (name, outcome, delta)
         })
         .collect();
@@ -1063,8 +1022,8 @@ fn main() {
 
     print_validation_report(&entries);
 
-    println!("RSS delta per corpus file:\n");
-    println!("{:<45} {:>12}", "file", "RSS delta");
+    println!("Heap delta per corpus file:\n");
+    println!("{:<45} {:>12}", "file", "heap delta");
     println!("{}", "-".repeat(59));
     let mut max_delta: u64 = 0;
     for (name, _, delta) in &entries {
@@ -1080,17 +1039,17 @@ fn main() {
     // catching genuinely pathological inputs well below an arbitrary ceiling.
     //
     // This number is only a starting point.  After a warm-up run of ~10 minutes,
-    // re-calibrate by plotting the actual RSS-delta distribution across all
+    // re-calibrate by plotting the actual heap-delta distribution across all
     // inputs that reached run_typing and tighten the threshold to e.g. the
     // 99.9th percentile plus one multiplier step.
     let suggested = (max_delta * 5).max(1024 * 1024);
     let suggested_mib = suggested.div_ceil(1024 * 1024);
     println!();
     println!("Max observed delta : {} KiB", max_delta / 1024);
-    println!("Suggested RSS_DELTA_LIMIT_BYTES: {suggested_mib} MiB  ({suggested} bytes)");
+    println!("Suggested HEAP_DELTA_LIMIT_BYTES: {suggested_mib} MiB  ({suggested} bytes)");
     println!();
     println!(
         "This is a seed-based estimate (5× worst seed).  Re-calibrate after a \
-         ~10-minute warm-up run using the actual RSS-delta distribution."
+         ~10-minute warm-up run using the actual heap-delta distribution."
     );
 }

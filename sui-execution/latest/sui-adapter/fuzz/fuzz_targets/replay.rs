@@ -7,10 +7,14 @@
 //!   ./replay crashes/file1 crashes/file2 ...
 //!   ./replay crashes/          # all files in a directory
 //!
-//! For each file, prints: path | bytes | BCS decode | pipeline stage | panic? | RSS delta
+//! For each file, prints: path | bytes | BCS decode | pipeline stage | panic? | heap delta
 
 use std::{path::PathBuf, time::Instant};
 use sui_types::transaction::ProgrammableTransaction;
+use tikv_jemalloc_ctl::{epoch, stats};
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[path = "fixture.rs"]
 mod fixture;
@@ -24,16 +28,15 @@ extern "C" fn __sanitizer_cov_trace_pc_guard_init(_start: *mut u32, _stop: *mut 
 #[unsafe(no_mangle)]
 extern "C" fn __sanitizer_cov_trace_pc_indir(_callee: usize) {}
 
-fn current_anon_rss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("RssAnon:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u64>().ok())
-        })
-        .unwrap_or(0)
+fn current_heap_bytes() -> u64 {
+    epoch::mib()
+        .expect("jemalloc epoch mib")
+        .advance()
+        .expect("jemalloc epoch advance");
+    stats::allocated::mib()
+        .expect("jemalloc allocated mib")
+        .read()
+        .expect("jemalloc allocated read") as u64
 }
 
 fn collect_paths(args: impl Iterator<Item = String>) -> Vec<PathBuf> {
@@ -62,7 +65,7 @@ fn main() {
     }
 
     println!("{:<60} {:>8}  {:<12}  {:>8}  {:>8}",
-             "file", "bytes", "stage", "anon_rss∆", "wall_ms");
+             "file", "bytes", "stage", "heap∆", "wall_ms");
     println!("{}", "-".repeat(110));
 
     for path in &paths {
@@ -72,7 +75,7 @@ fn main() {
         };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
 
-        let rss_before = current_anon_rss_kb();
+        let heap_before = current_heap_bytes();
         let t0 = Instant::now();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -85,8 +88,8 @@ fn main() {
                         PipelineStage::Loading => "loading_fail",
                         PipelineStage::Typing  => "typing_ok",
                     };
-                    let rss_delta = current_anon_rss_kb().saturating_sub(rss_before);
-                    (label.to_string(), rss_delta)
+                    let heap_delta = current_heap_bytes().saturating_sub(heap_before);
+                    (label.to_string(), heap_delta)
                 }
             }
         }));
@@ -98,11 +101,11 @@ fn main() {
                 println!("{:<60} {:>8}  {:<12}  {:>8}  {:>8}  *** PANIC ***",
                          name, bytes.len(), "PANIC", "?", wall_ms);
             }
-            Ok((stage, rss_delta_kb)) => {
-                let rss_mib = rss_delta_kb as f64 / 1024.0;
-                let flag = if rss_delta_kb > 62 * 1024 { "  *** RSS ***" } else { "" };
+            Ok((stage, heap_delta)) => {
+                let heap_mib = heap_delta as f64 / (1024.0 * 1024.0);
+                let flag = if heap_delta > 62 * 1024 * 1024 { "  *** HEAP ***" } else { "" };
                 println!("{:<60} {:>8}  {:<12}  {:>6.1} MiB  {:>8}{flag}",
-                         name, bytes.len(), stage, rss_mib, wall_ms);
+                         name, bytes.len(), stage, heap_mib, wall_ms);
             }
         }
     }
