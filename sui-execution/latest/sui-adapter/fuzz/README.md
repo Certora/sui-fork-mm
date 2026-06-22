@@ -142,7 +142,7 @@ e101a7f8bedac268                                             1260376  typing_ok 
 | Column | Meaning |
 |--------|---------|
 | `stage` | Where the pipeline stopped: `decode_fail` (BCS parse error), `linkage_fail`, `loading_fail`, or `typing_ok` (reached and completed translate_and_verify) |
-| `anon_rss∆` | Net change in anonymous RSS (heap + stack only) over the iteration — a proxy for per-input allocation |
+| `anon_rss∆` | Net change in anonymous RSS (heap + stack) over the iteration — a proxy for per-input allocation |
 | `wall_ms` | Wall-clock time for the iteration |
 | `*** PANIC ***` | The input triggered a panic or `invariant_violation!` — a real finding |
 | `*** RSS ***` | `anon_rss∆` exceeded 62 MiB — a potential OOM finding |
@@ -154,14 +154,14 @@ e101a7f8bedac268                                             1260376  typing_ok 
   RUST_BACKTRACE=1 ./replay crashes/<hash>
   ```
 - Lines where `stage = decode_fail` or `loading_fail` are almost certainly false positives — the input never reached the target.
-- `typing_ok` with low `anon_rss∆` and short `wall_ms` that re-runs cleanly indicates the objective was triggered by RSS baseline drift during a long in-process campaign (the `VmRSS` snapshot before the iteration was elevated by shared memory accumulation, making the delta look larger than it was).  These are not findings.
-- High `anon_rss∆` values (≫ the 62 MiB threshold) on `typing_ok` inputs that don't panic are worth investigating: they indicate the typing pass allocates pathologically on certain input shapes even without crashing.
+- `typing_ok` with low `anon_rss∆` and short `wall_ms` that re-runs cleanly indicates the objective was triggered by RSS baseline drift during a long in-process campaign (see below). These are not findings.
+- High `anon_rss∆` values on `typing_ok` inputs that don't panic are worth investigating: they indicate the typing pass allocates pathologically on certain input shapes even without crashing.
 
 **Prioritisation:**
 
 ```sh
 # Panics first
-grep 'PANIC' <(./replay crashes/)
+./replay crashes/ | grep 'PANIC'
 
 # Then large anon RSS on typing_ok inputs
 ./replay crashes/ | awk '$3=="typing_ok" {gsub(/MiB/,""); if ($4+0 > 20) print}' | sort -k4 -rn
@@ -175,21 +175,33 @@ grep 'PANIC' <(./replay crashes/)
 `InProcessExecutor` runs the harness in the same process across all iterations.
 Over a long campaign the process RSS grows steadily: the corpus accumulates in
 memory, LibAFL's shared-memory edge map and backtrace observer expand, and the
-Rust allocator's free lists grow.  If the per-iteration delta is measured
-against the live RSS (`VmRSS`), this baseline drift is baked into the "before"
-snapshot, inflating small legitimate allocations into apparent threshold
-violations.
+Rust allocator's free lists grow.
 
-The harness now measures `RssAnon` (private anonymous pages only) rather than
-`VmRSS`.  `VmRSS = RssAnon + RssFile + RssShmem`; the file-backed and
-shared-memory components fluctuate with kernel paging activity and accumulate
-with LibAFL's own shared-memory segments independently of anything the input
-causes.  `RssAnon` eliminates those two components.  It does not give a
-perfectly isolated view of harness-only allocations — the Rust allocator's
-free lists are also anonymous heap pages and grow over time — but the delta is
-measured tightly within the harness closure, so LibAFL's own per-iteration
-allocations (which run outside the closure) are excluded.  The result is
-significantly less drift than `VmRSS`, not zero drift.
+The harness measures the RSS delta within the harness closure — `rss_before` at
+entry, `rss_after` at exit.  LibAFL's per-iteration allocations (input
+selection, mutation, corpus updates, feedback evaluation) run outside the
+closure and are therefore excluded from the delta window.  What the metric
+captures is: BCS deserialization + `run_typing` allocations + any allocator
+free-list growth caused by those calls.
+
+The metric is `RssAnon` (private anonymous pages) rather than `VmRSS`.
+`VmRSS = RssAnon + RssFile + RssShmem`; the file-backed and shared-memory
+components fluctuate with kernel paging activity and accumulate with LibAFL's
+own shared-memory segments independently of anything the input causes.
+`RssAnon` eliminates those two components.  It does not give a perfectly
+isolated view of harness-only allocations — `RssAnon` covers the entire
+process's anonymous heap, including LibAFL's own heap footprint — but the
+delta is tightly scoped to the closure, so LibAFL's steady-state allocations
+cancel out in the subtraction.  Residual drift comes from the Rust allocator
+retaining freed memory in its free lists rather than returning pages to the OS;
+this is much slower than the shared-memory accumulation that made `VmRSS`
+unusable, but it can still inflate deltas in very long campaigns.
+
+On macOS, `RssAnon` is not available.  The macOS implementation uses Mach task
+info `resident_size`, which is closer to `VmRSS` than `RssAnon` in that it
+includes shared library pages.  `phys_footprint` (also from Mach task info)
+would be a better proxy for anonymous allocations on macOS but has not been
+validated yet — the relevant TODO is in `translate_and_verify.rs`.
 
 ---
 
@@ -202,31 +214,69 @@ its time on inputs that are rejected at the BCS layer before any interesting
 code is reached.
 
 Each seed is a hand-crafted worst case for a specific code path in the typing
-pipeline.
+pipeline.  The seeds are grouped into three tiers by what they can exercise.
+
+### Tier 1 — built-in commands only (01–16)
+
+These seeds use only `SplitCoins`, `MergeCoins`, `MakeMoveVec`, and
+`TransferObjects`.  They never reference an on-chain package, so they pass
+loading entirely and drive the typing pass directly.
 
 | File | Strategy | What it stresses |
 |------|----------|-----------------|
-| `01_minimal_transfer` | Single `TransferObjects(GasCoin, addr)` | Baseline — confirms the fixture initialises correctly and a well-formed PTB passes all checks |
-| `02_empty_ptb` | Zero inputs, zero commands | Edge: empty-collection handling throughout the pipeline |
-| `03_split_merge_chain_512` | 512 alternating `SplitCoins`/`MergeCoins` pairs (1024 commands total) | `invariant_checks::memory_safety`: each pair extends the reference derivation chain (`Path::extensions` cloning), producing O(n) `Vec<Delta>` growth |
-| `04_make_move_vec_fan_out_255` | One `MakeMoveVec` command with 255 identical arguments | `translate::Context` argument-splatting and the O(#args) result-accumulation loop |
-| `05_deep_result_chain_64` | 64 `MakeMoveVec` commands, each wrapping the previous result in a deeper `vector<…>` type | `Path::extensions` clone depth; each step adds a derivation delta to the chain of the final result |
-| `06_deep_type_args_16` | `MoveCall` with a type argument nested 16 levels deep (`Coin<Coin<…<SUI>…>>`) | `metering::typing` type-node counting on maximally nested types; hits `max_type_argument_depth` |
+| `01_minimal_transfer` | Single `TransferObjects(GasCoin, addr)` | Baseline — fixture initialises correctly, well-formed PTB passes all checks |
+| `02_empty_ptb` | Zero inputs, zero commands | Empty-collection handling throughout the pipeline |
+| `03_split_merge_chain_512` | 512 alternating `SplitCoins`/`MergeCoins` pairs | `memory_safety`: O(n) `Vec<Delta>` growth in the reference derivation chain |
+| `04_make_move_vec_fan_out_255` | One `MakeMoveVec` with 255 identical arguments | O(#args) result-accumulation loop in `translate::Context` |
+| `05_deep_result_chain_64` | 64 `MakeMoveVec` commands, each wrapping the previous | `Path::extensions` clone depth |
+| `06_deep_type_args_16` | `MoveCall` with a type argument nested 16 levels deep | `metering::typing` type-node counting; `max_type_argument_depth` |
 | `07_wide_type_args_16` | `MoveCall` with 16 distinct type arguments | Type-argument width validation and per-argument metering |
-| `08_max_pure_multi_use_64` | A single 16 KiB pure input referenced by 64 commands | `IndexSet` bytes-interning growth; type-inference paths that re-evaluate the same pure input against different expected types |
-| `09_nested_result_crossref_512` | 512-command linear `NestedResult` chain — each command references the previous via `NestedResult(i, 0)` | Out-of-bounds path in `translate::Context::locations()`; `NestedResult` index handling |
-| `10_transfer_fan_in_255` | 255 `SplitCoins` results collected by one `TransferObjects` | Many-input memory-safety tracking; argument-count validation |
+| `08_max_pure_multi_use_64` | Single 16 KiB pure input referenced by 64 commands | `IndexSet` bytes-interning growth; pure-input re-evaluation |
+| `09_nested_result_crossref_512` | 512-command `NestedResult` chain, each referencing the previous | `NestedResult` index handling; `translate::Context::locations()` |
+| `10_transfer_fan_in_255` | 255 `SplitCoins` results into one `TransferObjects` | Many-input memory-safety tracking; argument-count validation |
+| `11_split_many_amounts_255` | `SplitCoins(GasCoin, [amt]*255)` | Multi-return result sub-index handling |
+| `12_nested_result_fan_in_64` | `SplitCoins` → 64 results → `TransferObjects` via `NestedResult(0,i)` | `NestedResult` sub-index validation across a wide range |
+| `13_split_chain_256` | 256-deep chain of `SplitCoins` each consuming the previous | Linear mutable-borrow derivation; `Path::extensions` growth |
+| `14_make_vec_primitives` | Three `MakeMoveVec` commands over `Bool`, `U8`, `Address` (32 args each) | Primitive type unification; pure-input interning across expected types |
+| `15_merge_split_cycle` | `SplitCoins`→`MergeCoins`→`SplitCoins`→`MergeCoins` on `NestedResult` refs | Borrow-graph path convergence; non-linear derivation chains |
+| `16_split_max_width_boundary` | `SplitCoins(GasCoin, [amt]*255)` + `TransferObjects` at indices 0 and 254 | Maximum sub-result index validation; `u16` boundary near 255 |
 
-The seeds above (01–10) include `MoveCall` commands referencing the Sui framework package, which fail at the loading pass because the fixture store only contains system packages — not arbitrary on-chain objects.  The seeds below (11–16) use **only** `SplitCoins`, `MergeCoins`, `MakeMoveVec` (with primitive types), and `TransferObjects`, so they pass the loading pass entirely and exercise deeper paths in the typing pass.  They also introduce `NestedResult` sub-indexing, which none of the original seeds cover.
+### Tier 2 — MoveCall into framework packages (17–25)
+
+These seeds call functions in `0x1` (Move stdlib) or `0x2` (Sui framework),
+which are present in the fixture store.  They exercise `MoveCall` typing with
+real package resolution.
 
 | File | Strategy | What it stresses |
 |------|----------|-----------------|
-| `11_split_many_amounts_255` | `SplitCoins(GasCoin, [amt]*255)` — one command producing 255 sub-results | Multi-return result sub-index handling; result-type `Vec` capacity for wide single commands |
-| `12_nested_result_fan_in_64` | `SplitCoins` producing 64 sub-results, all collected by `TransferObjects` via `NestedResult(0, i)` | `NestedResult` sub-index validation across a wide range; borrow-tracking of many independently derived coin references |
-| `13_split_chain_256` | 256-deep chain of `SplitCoins` each consuming the previous result | Linear mutable-borrow derivation; `Path::extensions` growth through a chained coin type |
-| `14_make_vec_primitives` | Three `MakeMoveVec` commands over `Bool`, `U8`, and `Address` pure inputs (32 args each) | Primitive type unification; pure-input interning across different expected types |
-| `15_merge_split_cycle` | `SplitCoins` → `MergeCoins` → `SplitCoins` → `MergeCoins` interleaved on `NestedResult` and `Result` references | Borrow-graph path convergence; coins merged then re-split, testing the memory-safety pass on non-linear derivation chains |
-| `16_split_max_width_boundary` | `SplitCoins(GasCoin, [amt]*255)` followed by `TransferObjects` referencing sub-indices 0 and 254 (boundary values) | Maximum sub-result index validation; `u16` boundary near 255 |
+| `17_move_call_no_args` | `0x2::address::length()` — no inputs, no type args | Minimal MoveCall path through loading + typing |
+| `18_move_call_pure_primitive` | `0x2::address::from_u256(u256)` — pure input → primitive param | Pure-input → primitive-parameter binding; type inference inside MoveCall |
+| `19_move_call_vector_arg` | `0x1::ascii::string(vector<u8>)` — pure bytes → `vector<u8>` param | Pure-input → `vector<u8>` binding; framework struct as result type |
+| `20_move_call_generic_type_arg` | `0x1::type_name::get<Coin<SUI>>()` — generic with no value args | Generic type-arg substitution when there are no value arguments to constrain it |
+| `21_move_call_reference_arg` | `0x2::hash::keccak256(&vector<u8>)` — pure input by immutable ref | Borrow inference for pure input fed to a `&T` parameter |
+| `22_move_call_result_chain_64` | 64 alternating `from_u256`/`to_u256` calls threading results | Result-type propagation across many MoveCalls |
+| `23_move_call_make_vec_of_results_64` | 64 `from_u256` calls + `MakeMoveVec<address>([R0..R63])` | MoveCall results fed into a built-in command's argument list |
+| `24_make_move_vec_none_infer` | `MakeMoveVec(None, [addr, addr])` — type inferred, not annotated | `MakeMoveVec` element-type inference branch; object-type validation error path |
+| `25_make_move_vec_empty_typed` | `MakeMoveVec<u64>([])` — typed but empty | Zero-argument branch of `MakeMoveVec` typing |
+
+### Tier 3 — MoveCall into the synthetic fuzz-fixture package (26–32)
+
+The fixture module at address `0xface` is compiled at harness startup and
+injected into the in-memory store alongside the system packages.  It exposes a
+wide variety of function signatures — primitives, vectors, references, generics
+with ability bounds, user-defined structs, and multiple-return functions — so
+`MoveCall` seeds have a controllable, resolvable target that covers paths the
+framework seeds cannot reach.
+
+| File | Strategy | What it stresses |
+|------|----------|-----------------|
+| `26_fixture_no_args` | `nothing()` — no arguments, no return | Minimal MoveCall to a user package |
+| `27_fixture_take_primitive` | `take_u64(u64) → u64` | Pure input → user-function primitive parameter |
+| `28_fixture_struct_roundtrip` | `new_box(u64) → Box`, then `unbox(Box) → u64` | User-defined struct flowing as a MoveCall result into another call |
+| `29_fixture_generic_identity` | `identity<u64>(u64) → u64` | Generic substitution with a fixed type argument and a pure input |
+| `30_fixture_multi_return` | `two_values() → (u64, bool)`, components consumed via `NestedResult` | `NestedResult` sub-index on a MoveCall multiple-return |
+| `31_fixture_make_pair` | `make_pair<u64>(u64, u64) → Pair<u64>` — copyable pure input reused twice | Generic struct constructor with ability bounds; pure-input reuse |
+| `32_fixture_reference_arg` | `use_imm_ref(&u64) → u64` | Borrow inference for a pure input passed to a user function's `&T` |
 
 ---
 
@@ -303,39 +353,28 @@ new branch in `translate_and_verify` a genuine corpus event.
 
 ### RSS delta guard
 
-An RSS delta guard reads `RssAnon` from `/proc/self/status` before and after
-each harness call.  `RssAnon` covers only private anonymous pages (heap +
-stack), so it excludes two sources of noise that `VmRSS` picks up:
-file-backed pages (`RssFile`) paged in/out by the kernel on its own schedule,
-and shared-memory segments (`RssShmem`) — LibAFL's edge map and backtrace
-observer live here and accumulate steadily over a long in-process run.
-Using `VmRSS` causes baseline drift: the "before" snapshot is already elevated
-by those accumulated shared pages, inflating small legitimate allocations into
-apparent threshold violations.
+An RSS delta guard reads the current RSS before and after each harness call.
+Any input whose delta exceeds `RSS_DELTA_LIMIT_BYTES` is treated as a crash and
+saved to `./crashes/`.
 
-`RssAnon` is not a perfectly isolated view of harness-only allocations — the
-Rust allocator retains freed memory in its free lists rather than returning it
-to the OS, so even after `run_typing` drops all its data structures the
-anonymous RSS may not decrease.  The delta is still meaningful because it is
-measured within the harness closure: LibAFL's per-iteration work (input
-selection, mutation, corpus updates, feedback evaluation) runs *outside* the
-closure, so its allocations do not appear in the delta window.  What the metric
-captures is: BCS deserialization + `run_typing` allocations + any allocator
-free-list growth caused by those calls.  Long campaigns can still drift, but
-orders of magnitude more slowly than with `VmRSS`.
+**Linux:** uses `RssAnon` from `/proc/self/status`.  `RssAnon` covers only
+private anonymous pages (heap + stack), excluding file-backed pages (`RssFile`)
+and shared-memory segments (`RssShmem`) that fluctuate with kernel paging
+activity and accumulate with LibAFL's own shared-memory structures over a long
+in-process run.  `RssAnon` is not a perfectly isolated view of harness-only
+allocations — the full process anonymous heap is measured, not just
+`run_typing`'s heap — but the delta is scoped within the harness closure, so
+LibAFL's steady-state allocations cancel out in the subtraction.  Residual
+drift comes from the Rust allocator retaining freed pages in its free lists,
+but this is much slower than the `VmRSS` drift that afflicted earlier runs.
 
-Any input whose `RssAnon` delta exceeds `RSS_DELTA_LIMIT_BYTES` is treated as a
-crash and saved to `./crashes/`.
+**macOS:** uses Mach task info `resident_size`, which is closer to `VmRSS`
+than `RssAnon` (it includes shared library pages).  `phys_footprint` would be
+a better proxy but has not been validated yet — see the TODO in
+`translate_and_verify.rs`.
 
 The threshold is set empirically: `gen_corpus` runs each seed through the real
 pipeline, reports the delta per file, and suggests **5× the worst-case observed
-value**.  The seeds are already hand-crafted extremes, so a legitimate fuzz
-mutation is unlikely to allocate more than a few multiples of the worst seed;
-5× leaves headroom without being so generous that anomalous inputs go
-undetected.  As of the current seed set the worst case is
+value**.  As of the current seed set the worst case is
 `04_make_move_vec_fan_out_255` at ~12.3 MiB, giving a threshold of **62 MiB**.
-
-This is a starting-point estimate.  After a warm-up run of ~10 minutes,
-re-calibrate by plotting the actual RSS-delta distribution across all inputs
-that reached `run_typing` and tighten the threshold to the 99.9th percentile
-plus one multiplier step.
+Re-calibrate with `--rss-threshold-from` after a ~10-minute warm-up run.
