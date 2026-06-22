@@ -19,22 +19,27 @@
 //! 5  RemoveCommand        drop a random command
 //! 6  AddPureInput         append a fresh pure-u64 input
 //! 7  RemoveInput          drop a random unused-looking input
-//! 8  ScrambleArgument     replace one Argument in a random command with GasCoin / Input(0)
+//! 8  Scr ambleArgument     replace one Argument in a random command with GasCoin / Input(0) /
+//!                         Result(n) / NestedResult(n,j)
 //! 9  FanOutArgs           repeat the argument list of a random command N times (stress splatting)
 //! 10 DeepResultChain      append a chain of MakeMoveVec wrapping the last result (stress Path clone)
 //! 11 NestTypeArg          wrap the first type-arg of a random MoveCall one level deeper in vector<>
+//! 12 AddMoveCall          insert a MoveCall to a known-valid function in the fuzz-fixture
+//!                         package or 0x2::coin / 0x2::object / 0x2::transfer
 
+use crate::fixture::{ADDRESS, MODULE};
 use std::num::NonZeroUsize;
 
 use libafl::{
+    Error,
     corpus::CorpusId,
     inputs::{BytesInput, HasTargetBytes},
     mutators::{MutationResult, Mutator},
-    Error,
 };
 use libafl_bolts::{Named, rands::Rand};
 use sui_types::{
-    transaction::{Argument, CallArg, Command, ProgrammableTransaction},
+    base_types::ObjectID,
+    transaction::{Argument, CallArg, Command, ProgrammableMoveCall, ProgrammableTransaction},
     type_input::TypeInput,
 };
 
@@ -129,7 +134,9 @@ fn mut_remove_input<R: Rand>(rng: &mut R, ptb: &mut ProgrammableTransaction) {
     }
 }
 
-/// Replace one Argument inside a random command with either GasCoin or Input(0).
+/// Replace one Argument inside a random command with GasCoin, Input(i), Result(n), or
+/// NestedResult(n,j). Including Result/NestedResult is important for exercising command
+/// chaining inside the typing pass.
 fn mut_scramble_argument<R: Rand>(rng: &mut R, ptb: &mut ProgrammableTransaction) {
     // Collect (cmd_idx, arg_idx) pairs for every mutable Argument slot.
     let slots: Vec<(usize, usize)> = ptb
@@ -151,10 +158,24 @@ fn mut_scramble_argument<R: Rand>(rng: &mut R, ptb: &mut ProgrammableTransaction
 
     if let Some(slot_i) = rand_idx(rng, slots.len()) {
         let (ci, ai) = slots[slot_i];
-        let replacement = if rng.below(NonZeroUsize::new(2).unwrap()) == 0 {
-            Argument::GasCoin
-        } else {
-            Argument::Input(0)
+        let n_cmds = ptb.commands.len() as u16;
+        let n_inputs = ptb.inputs.len() as u16;
+        // 4 classes of argument; bias toward Result when there are prior commands.
+        let replacement = match rng.below(NonZeroUsize::new(4).unwrap()) {
+            0 => Argument::GasCoin,
+            1 => Argument::Input(if n_inputs > 0 {
+                rng.below(NonZeroUsize::new(n_inputs as usize).unwrap()) as u16
+            } else {
+                0
+            }),
+            2 if n_cmds > 0 => {
+                Argument::Result(rng.below(NonZeroUsize::new(n_cmds as usize).unwrap()) as u16)
+            }
+            3 if n_cmds > 0 => Argument::NestedResult(
+                rng.below(NonZeroUsize::new(n_cmds as usize).unwrap()) as u16,
+                rng.below(NonZeroUsize::new(8).unwrap()) as u16,
+            ),
+            _ => Argument::GasCoin,
         };
         match &mut ptb.commands[ci] {
             Command::MoveCall(mc) => mc.arguments[ai] = replacement,
@@ -263,6 +284,92 @@ fn nested_vector_type(depth: u32) -> TypeInput {
     t
 }
 
+/// Insert a MoveCall to a known-valid function drawn from a static table covering
+/// the fuzz-fixture package and key framework entry points in `0x2::coin` /
+/// `0x2::object` / `0x2::transfer`.  All entries are resolvable by the fixture
+/// store, so the input will reach the loading/typing passes instead of dying at
+/// linkage.  Arguments are set to `GasCoin` / `Input(0)` / `Result(prev)` in
+/// whatever combination satisfies the arity — the typing pass will reject bad
+/// types, which is expected and fine; what matters is reaching the pass at all.
+fn mut_add_move_call<R: Rand>(rng: &mut R, ptb: &mut ProgrammableTransaction) {
+    // (package_hex, module, function, num_ty_args, num_args)
+    // num_ty_args: how many TypeInput::U64 type arguments to supply.
+    // num_args: how many Argument slots to fill (typing will reject wrong types).
+    const FUNCS: &[(&str, &str, &str, usize, usize)] = &[
+        // fuzz_fixture — no type args
+        (ADDRESS, MODULE, "nothing", 0, 0),
+        (ADDRESS, MODULE, "take_u8", 0, 1),
+        (ADDRESS, MODULE, "take_u64", 0, 1),
+        (ADDRESS, MODULE, "take_u128", 0, 1),
+        (ADDRESS, MODULE, "take_u256", 0, 1),
+        (ADDRESS, MODULE, "take_bool", 0, 1),
+        (ADDRESS, MODULE, "take_address", 0, 1),
+        (ADDRESS, MODULE, "take_vec_u64", 0, 1),
+        (ADDRESS, MODULE, "take_vec_address", 0, 1),
+        (ADDRESS, MODULE, "use_imm_ref", 0, 1),
+        (ADDRESS, MODULE, "use_mut_ref", 0, 1),
+        (ADDRESS, MODULE, "new_box", 0, 1),
+        (ADDRESS, MODULE, "unbox", 0, 1),
+        (ADDRESS, MODULE, "box_value", 0, 1),
+        (ADDRESS, MODULE, "two_values", 0, 0),
+        (ADDRESS, MODULE, "take_key_box", 0, 1),
+        (ADDRESS, MODULE, "key_box_value", 0, 1),
+        (ADDRESS, MODULE, "receive_sui_coin", 0, 2),
+        (ADDRESS, MODULE, "receive_key_box", 0, 2),
+        (ADDRESS, MODULE, "private_non_entry", 0, 1),
+        (ADDRESS, MODULE, "private_take_u64", 0, 1),
+        (ADDRESS, MODULE, "make_hot_potato", 0, 0),
+        (ADDRESS, MODULE, "two_hot_potatoes", 0, 0),
+        (ADDRESS, MODULE, "take_hot_potato", 0, 1),
+        // fuzz_fixture — with type args
+        (ADDRESS, MODULE, "identity", 1, 1),
+        (ADDRESS, MODULE, "ignore", 1, 1),
+        (ADDRESS, MODULE, "make_pair", 1, 2),
+        (ADDRESS, MODULE, "swap", 1, 2),
+        // 0x2::coin
+        ("0x2", "coin", "value", 1, 1),
+        ("0x2", "coin", "zero", 1, 0),
+        ("0x2", "coin", "join", 1, 2),
+        ("0x2", "coin", "split", 1, 2),
+        ("0x2", "coin", "destroy_zero", 1, 1),
+        // 0x2::object
+        ("0x2", "object", "id_address", 0, 1),
+        // 0x2::transfer
+        ("0x2", "transfer", "public_freeze_object", 1, 1),
+        ("0x2", "transfer", "public_share_object", 1, 1),
+        ("0x2", "transfer", "transfer", 1, 2),
+    ];
+
+    let choice = rng.below(NonZeroUsize::new(FUNCS.len()).unwrap());
+    let (pkg_hex, module, function, num_ty_args, num_args) = FUNCS[choice];
+
+    let package = ObjectID::from_hex_literal(pkg_hex).unwrap_or(ObjectID::ZERO);
+
+    let type_arguments: Vec<TypeInput> = (0..num_ty_args).map(|_| TypeInput::U64).collect();
+
+    // Build an argument list: prefer existing Results for chaining, fall back to GasCoin.
+    let n_cmds = ptb.commands.len() as u16;
+    let arguments: Vec<Argument> = (0..num_args)
+        .map(|i| {
+            if n_cmds > 0 && i == 0 {
+                // Use the most recent result as the first argument to encourage chaining.
+                Argument::Result(n_cmds - 1)
+            } else {
+                Argument::GasCoin
+            }
+        })
+        .collect();
+
+    ptb.commands
+        .push(Command::MoveCall(Box::new(ProgrammableMoveCall {
+            package,
+            module: module.to_string(),
+            function: function.to_string(),
+            type_arguments,
+            arguments,
+        })));
+}
+
 /// Wrap the first type-argument of a random MoveCall one level deeper in `vector<>`.
 fn mut_nest_type_arg<R: Rand>(rng: &mut R, ptb: &mut ProgrammableTransaction) {
     let move_calls: Vec<usize> = ptb
@@ -295,7 +402,7 @@ fn mut_nest_type_arg<R: Rand>(rng: &mut R, ptb: &mut ProgrammableTransaction) {
 // Public mutator struct
 // ──────────────────────────────────────────────────────────────────────────────
 
-const NUM_OPS: usize = 12;
+const NUM_OPS: usize = 13;
 
 pub struct PtbMutator;
 
@@ -309,9 +416,7 @@ where
             return Ok(MutationResult::Skipped);
         };
 
-        let op = state
-            .rand_mut()
-            .below(NonZeroUsize::new(NUM_OPS).unwrap());
+        let op = state.rand_mut().below(NonZeroUsize::new(NUM_OPS).unwrap());
 
         let rng = state.rand_mut();
         match op {
@@ -327,6 +432,7 @@ where
             9 => mut_fan_out_args(rng, &mut ptb),
             10 => mut_deep_result_chain(rng, &mut ptb),
             11 => mut_nest_type_arg(rng, &mut ptb),
+            12 => mut_add_move_call(rng, &mut ptb),
             _ => unreachable!(),
         }
 

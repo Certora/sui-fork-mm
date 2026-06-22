@@ -15,7 +15,10 @@ extern crate libc;
 
 #[path = "fixture.rs"]
 mod fixture;
-use fixture::{Fixture, PipelineStage, run_typing};
+use fixture::{
+    fuzz_fixture::{key_box_type, move_call as fixture_call},
+    Fixture, FuzzHarnessObjectRefs, PipelineStage, build_fuzz_harness_objects, run_typing,
+};
 
 // The .cargo/config.toml injects sancov rustflags for every binary in this crate.
 // gen_corpus doesn't link libafl_targets, so provide no-op stubs for the two
@@ -58,15 +61,6 @@ fn stdlib_pkg() -> ObjectID {
     MOVE_STDLIB_PACKAGE_ID
 }
 
-/// Address (and package ID) of the synthetic fuzz-fixture package built by the
-/// `Fixture` (see `fixture.rs`). Must match the module address in its source.
-const FUZZ_FIXTURE_ADDRESS: &str = "0xface";
-
-/// Package ID of the fuzz-fixture package.
-fn fuzz_fixture_package_id() -> ObjectID {
-    ObjectID::from_hex_literal(FUZZ_FIXTURE_ADDRESS).expect("valid fixture address")
-}
-
 /// Build a `MoveCall` command against a framework package.
 fn move_call(
     package: ObjectID,
@@ -94,18 +88,23 @@ fn ident(s: &str) -> String {
     s.to_owned()
 }
 
+/// `0x2::sui::SUI`
+fn sui_type() -> TypeInput {
+    TypeInput::Struct(Box::new(StructInput {
+        address: AccountAddress::from(SUI_FRAMEWORK_PACKAGE_ID),
+        module: ident("sui"),
+        name: ident("SUI"),
+        type_params: vec![],
+    }))
+}
+
 /// `0x2::coin::Coin<0x2::sui::SUI>`
 fn sui_coin_type() -> TypeInput {
     TypeInput::Struct(Box::new(StructInput {
         address: AccountAddress::from(SUI_FRAMEWORK_PACKAGE_ID),
         module: ident("coin"),
         name: ident("Coin"),
-        type_params: vec![TypeInput::Struct(Box::new(StructInput {
-            address: AccountAddress::from(SUI_FRAMEWORK_PACKAGE_ID),
-            module: ident("sui"),
-            name: ident("SUI"),
-            type_params: vec![],
-        }))],
+        type_params: vec![sui_type()],
     }))
 }
 
@@ -369,6 +368,16 @@ fn minimal_transfer() -> ProgrammableTransaction {
             vec![Argument::GasCoin],
             Argument::Input(0),
         )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 10 — Empty PTB (edge case: zero commands)
+// ---------------------------------------------------------------------------
+fn empty_ptb() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![],
     }
 }
 
@@ -781,28 +790,13 @@ fn make_move_vec_empty_typed() -> ProgrammableTransaction {
 }
 
 // ---------------------------------------------------------------------------
-// Scenarios 26–32 — Calls into the synthetic fuzz-fixture package (`0xface`)
+// Scenarios 26–32 — Calls into the synthetic fuzz-fixture package
 //
 // Unlike the framework `MoveCall` seeds, these target a purpose-built package
-// (defined in fixture.rs) whose functions span primitives, vectors, references,
+// (see `fuzz_fixture.rs`) whose functions span primitives, vectors, references,
 // generics with ability bounds, structs, and multiple returns. They drive the
 // MoveCall typing path through a controllable, resolvable target.
 // ---------------------------------------------------------------------------
-
-/// `0xface::fuzz_fixture::<function>(...)`.
-fn fixture_call(
-    function: &str,
-    type_arguments: Vec<TypeInput>,
-    arguments: Vec<Argument>,
-) -> Command {
-    move_call(
-        fuzz_fixture_package_id(),
-        "fuzz_fixture",
-        function,
-        type_arguments,
-        arguments,
-    )
-}
 
 // Scenario 26 — fixture call with no arguments or type arguments (`nothing()`).
 fn fixture_no_args() -> ProgrammableTransaction {
@@ -893,14 +887,620 @@ fn fixture_reference_arg() -> ProgrammableTransaction {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 10 — Empty PTB (edge case: zero commands)
+// Scenario 33 — SplitCoins on an owned coin object input (not GasCoin)
+//
+// What it stresses: `CallArg::Object(ImmOrOwnedObject)` loading, owned-object
+// memory-safety tracking, and SplitCoins on a non-gas coin argument.
 // ---------------------------------------------------------------------------
-fn empty_ptb() -> ProgrammableTransaction {
+fn split_owned_coin(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let amt = bcs::to_bytes(&1u64).unwrap();
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
     ProgrammableTransaction {
-        inputs: vec![],
-        commands: vec![],
+        inputs: vec![
+            refs.owned_coin_input(),
+            sui_types::transaction::CallArg::Pure(amt),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            Command::SplitCoins(Argument::Input(0), vec![Argument::Input(1)]),
+            Command::TransferObjects(vec![Argument::NestedResult(0, 0)], Argument::Input(2)),
+        ],
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 34 — MergeCoins across two owned coin object inputs
+//
+// What it stresses: multiple object inputs, MergeCoins fan-in, and consuming
+// two distinct owned objects in one command.
+// ---------------------------------------------------------------------------
+fn merge_two_owned_coins(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.owned_coin_input(),
+            refs.second_owned_coin_input(),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            Command::MergeCoins(Argument::Input(0), vec![Argument::Input(1)]),
+            Command::TransferObjects(vec![Argument::Input(0)], Argument::Input(2)),
+        ],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 35 — TransferObjects of an owned coin object input
+//
+// What it stresses: object input typed as `Coin<SUI>` flowing directly into
+// TransferObjects without an intermediate builtin command.
+// ---------------------------------------------------------------------------
+fn transfer_owned_coin(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.owned_coin_input(),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![Command::TransferObjects(
+            vec![Argument::Input(0)],
+            Argument::Input(1),
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 36 — SplitCoins on a mutable shared coin object input
+//
+// What it stresses: `ObjectArg::SharedObject` loading, consensus-object
+// permissions, and SplitCoins on a shared (non-gas) coin.
+// ---------------------------------------------------------------------------
+fn split_shared_coin(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let amt = bcs::to_bytes(&1u64).unwrap();
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.shared_coin_mut_input(),
+            sui_types::transaction::CallArg::Pure(amt),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            Command::SplitCoins(Argument::Input(0), vec![Argument::Input(1)]),
+            Command::TransferObjects(vec![Argument::NestedResult(0, 0)], Argument::Input(2)),
+        ],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 37 — MoveCall taking an immutable coin object by reference
+//
+// `0x2::coin::value<T>(c: &Coin<T>)` with an immutable coin object input.
+// What it stresses: immutable-object permissions and MoveCall argument binding
+// for `&T` parameters backed by a real on-chain object (not a pure input).
+// ---------------------------------------------------------------------------
+fn move_call_immutable_coin_ref(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.immutable_coin_input()],
+        commands: vec![move_call(
+            sui_pkg(),
+            "coin",
+            "value",
+            vec![sui_type()],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 38 — MoveCall on an owned coin object (`coin::value`)
+//
+// Same as scenario 37 but with a mutable owned coin, exercising the owned-
+// object borrow path for MoveCall reference parameters.
+// ---------------------------------------------------------------------------
+fn move_call_owned_coin_ref(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.owned_coin_input()],
+        commands: vec![move_call(
+            sui_pkg(),
+            "coin",
+            "value",
+            vec![sui_type()],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 39 — TransferObjects of a non-coin `key` object (`KeyBox`)
+//
+// What it stresses: object-input loading for a user-defined `key` struct (not
+// `Coin<SUI>`), plus `TransferObjects` on a non-droppable-by-default type.
+// ---------------------------------------------------------------------------
+fn transfer_key_box_object(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.parent_key_box_input(),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![Command::TransferObjects(
+            vec![Argument::Input(0)],
+            Argument::Input(1),
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 40 — MoveCall taking a `KeyBox` object by value
+//
+// What it stresses: non-coin object consumption in a user-module MoveCall.
+// ---------------------------------------------------------------------------
+fn move_call_key_box_by_value(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.parent_key_box_input()],
+        commands: vec![fixture_call("take_key_box", vec![], vec![Argument::Input(0)])],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 41 — MoveCall taking `&KeyBox` (immutable borrow of object input)
+// ---------------------------------------------------------------------------
+fn move_call_key_box_ref(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.parent_key_box_input()],
+        commands: vec![fixture_call("key_box_value", vec![], vec![Argument::Input(0)])],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 42 — `Receiving<Coin<SUI>>` resolved via `transfer::public_receive`
+//
+// Parent `KeyBox` (owned) + receiving coin (address-owned by parent ID).
+// What it stresses: the `ReceivingInput` loading/typing path and MoveCall
+// binding for `Receiving<T>` parameters.
+// ---------------------------------------------------------------------------
+fn receive_sui_coin_to_parent(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.parent_key_box_input(),
+            refs.receiving_coin_input(),
+        ],
+        commands: vec![fixture_call(
+            "receive_sui_coin",
+            vec![],
+            vec![Argument::Input(0), Argument::Input(1)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 43 — `Receiving<KeyBox>` resolved into the parent `KeyBox`
+// ---------------------------------------------------------------------------
+fn receive_key_box_to_parent(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.parent_key_box_input(),
+            refs.receiving_key_box_input(),
+        ],
+        commands: vec![fixture_call(
+            "receive_key_box",
+            vec![],
+            vec![Argument::Input(0), Argument::Input(1)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios 44–57 — Typed error seeds (reach `Typing`, return `Err`)
+//
+// These deliberately exercise type/argument validation branches inside
+// `typing::translate_and_verify` that the happy-path seeds never hit.
+// ---------------------------------------------------------------------------
+
+// `take_u64` expects one argument; supply two.
+fn err_fixture_wrong_arity() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![
+            sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u64).unwrap()),
+            sui_types::transaction::CallArg::Pure(bcs::to_bytes(&2u64).unwrap()),
+        ],
+        commands: vec![fixture_call(
+            "take_u64",
+            vec![],
+            vec![Argument::Input(0), Argument::Input(1)],
+        )],
+    }
+}
+
+// `take_u64` expects `u64`; supply BCS for `u8`.
+fn err_fixture_wrong_primitive() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u8).unwrap())],
+        commands: vec![fixture_call("take_u64", vec![], vec![Argument::Input(0)])],
+    }
+}
+
+// `Input(99)` is out of bounds for a PTB with a single pure input.
+fn err_input_index_oob() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u64).unwrap())],
+        commands: vec![fixture_call("take_u64", vec![], vec![Argument::Input(99)])],
+    }
+}
+
+// `coin::value<T>` expects `T = SUI`; supply `Coin<SUI>` as the type argument.
+fn err_coin_value_wrong_type_arg(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.owned_coin_input()],
+        commands: vec![move_call(
+            sui_pkg(),
+            "coin",
+            "value",
+            vec![sui_coin_type()],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// `SplitCoins` with one amount produces `NestedResult(0, 0)` only.
+fn err_nested_result_secondary_oob() -> ProgrammableTransaction {
+    let amt = bcs::to_bytes(&1u64).unwrap();
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            sui_types::transaction::CallArg::Pure(amt),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            Command::SplitCoins(Argument::GasCoin, vec![Argument::Input(0)]),
+            Command::TransferObjects(vec![Argument::NestedResult(0, 3)], Argument::Input(1)),
+        ],
+    }
+}
+
+// `MergeCoins` returns no results; `Result(0)` is invalid arity.
+fn err_merge_invalid_result_arity(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.owned_coin_input(),
+            refs.second_owned_coin_input(),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            Command::MergeCoins(Argument::Input(0), vec![Argument::Input(1)]),
+            Command::TransferObjects(vec![Argument::Result(0)], Argument::Input(2)),
+        ],
+    }
+}
+
+// Immutable objects cannot be transferred by value.
+fn err_transfer_immutable_by_value(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.immutable_coin_input(),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![Command::TransferObjects(
+            vec![Argument::Input(0)],
+            Argument::Input(1),
+        )],
+    }
+}
+
+// `use_mut_ref` expects `&mut u64`; pass an owned coin object input.
+fn err_mut_ref_on_coin_object(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.owned_coin_input()],
+        commands: vec![fixture_call("use_mut_ref", vec![], vec![Argument::Input(0)])],
+    }
+}
+
+// `option::some<u64>` with BCS bytes for a `u8` value.
+fn err_option_inner_type_mismatch() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u8).unwrap())],
+        commands: vec![move_call(
+            stdlib_pkg(),
+            "option",
+            "some",
+            vec![TypeInput::U64],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// `MakeMoveVec(Some(u64), …)` with a `u8` pure input.
+fn err_make_move_vec_elem_type_mismatch() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u8).unwrap())],
+        commands: vec![Command::MakeMoveVec(
+            Some(TypeInput::U64),
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// Consume the same `KeyBox` object input in two by-value MoveCalls.
+fn err_object_input_reuse_after_move(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.parent_key_box_input()],
+        commands: vec![
+            fixture_call("take_key_box", vec![], vec![Argument::Input(0)]),
+            fixture_call("take_key_box", vec![], vec![Argument::Input(0)]),
+        ],
+    }
+}
+
+// `Result(99)` is out of bounds on an empty command list.
+fn err_result_index_oob() -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(addr)],
+        commands: vec![Command::TransferObjects(
+            vec![Argument::Result(99)],
+            Argument::Input(0),
+        )],
+    }
+}
+
+// `TransferObjects` recipient must be an `address`; pass a `u64` pure input.
+fn err_transfer_wrong_recipient_type() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u64).unwrap())],
+        commands: vec![Command::TransferObjects(
+            vec![Argument::GasCoin],
+            Argument::Input(0),
+        )],
+    }
+}
+
+// `SplitCoins` requires a mutable reference; immutable coin inputs cannot satisfy it.
+fn err_split_immutable_coin(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let amt = bcs::to_bytes(&1u64).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.immutable_coin_input(),
+            sui_types::transaction::CallArg::Pure(amt),
+        ],
+        commands: vec![Command::SplitCoins(
+            Argument::Input(0),
+            vec![Argument::Input(1)],
+        )],
+    }
+}
+
+// `unbox` expects a `Box`; thread a `u64` result from `take_u64` instead.
+fn err_fixture_struct_type_mismatch() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u64).unwrap())],
+        commands: vec![
+            fixture_call("take_u64", vec![], vec![Argument::Input(0)]),
+            fixture_call("unbox", vec![], vec![Argument::Result(0)]),
+        ],
+    }
+}
+
+// `from_u256` expects 32 bytes; supply a truncated `u64` BCS payload.
+fn err_from_u256_truncated_bytes() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u64).unwrap())],
+        commands: vec![move_call(
+            sui_pkg(),
+            "address",
+            "from_u256",
+            vec![],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios 60–71 — verify-pass coverage (move_functions, drop_safety,
+// private_entry_arguments, framework MoveCalls)
+// ---------------------------------------------------------------------------
+
+// Scenario 60 — private non-`entry` function → `NonEntryFunctionInvoked`.
+fn err_private_non_entry() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&1u64).unwrap(),
+        )],
+        commands: vec![fixture_call(
+            "private_non_entry",
+            vec![],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// Scenario 61 — private `entry` with a plain primitive argument (OK path).
+fn fixture_private_entry_ok() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&42u64).unwrap(),
+        )],
+        commands: vec![fixture_call(
+            "private_take_u64",
+            vec![],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// Scenario 62 — hot-potato argument to a private `entry` while the clique stays hot.
+// The second call consumes the sibling hot potato so `drop_safety` passes; the error is
+// reported by `private_entry_arguments` on the first call.
+fn err_hot_potato_private_entry() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![
+            fixture_call("two_hot_potatoes", vec![], vec![]),
+            fixture_call(
+                "take_hot_potato",
+                vec![],
+                vec![Argument::NestedResult(0, 0)],
+            ),
+            fixture_call(
+                "take_hot_potato",
+                vec![],
+                vec![Argument::NestedResult(0, 1)],
+            ),
+        ],
+    }
+}
+
+// Scenario 63 — unused hot-potato result at end of PTB → `UnusedValueWithoutDrop`.
+fn err_unused_hot_potato() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![fixture_call("make_hot_potato", vec![], vec![])],
+    }
+}
+
+// Scenario 64 — multi-return hot potato: consume one, leave the other unused.
+fn err_unused_multi_return_hot_potato() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![
+            fixture_call("two_hot_potatoes", vec![], vec![]),
+            fixture_call(
+                "take_hot_potato",
+                vec![],
+                vec![Argument::NestedResult(0, 1)],
+            ),
+        ],
+    }
+}
+
+// Scenario 65 — `&mut u64` borrow of a pure input (OK; distinct from seed 52 on coin).
+fn fixture_mut_ref_pure_u64() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(
+            bcs::to_bytes(&9u64).unwrap(),
+        )],
+        commands: vec![fixture_call("use_mut_ref", vec![], vec![Argument::Input(0)])],
+    }
+}
+
+// Scenario 66 — `coin::split` via MoveCall; consume split coin and transfer remainder.
+fn move_call_coin_split_consume(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let amt = bcs::to_bytes(&1000u64).unwrap();
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.owned_coin_input(),
+            sui_types::transaction::CallArg::Pure(amt),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            move_call(
+                sui_pkg(),
+                "coin",
+                "split",
+                vec![sui_type()],
+                vec![Argument::Input(0), Argument::Input(1)],
+            ),
+            move_call(
+                sui_pkg(),
+                "coin",
+                "destroy_zero",
+                vec![sui_type()],
+                vec![Argument::Result(0)],
+            ),
+            Command::TransferObjects(vec![Argument::Input(0)], Argument::Input(2)),
+        ],
+    }
+}
+
+// Scenario 67 — `coin::split` leaves an owned coin result unused.
+fn err_unused_coin_split_result(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let amt = bcs::to_bytes(&1000u64).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.owned_coin_input(),
+            sui_types::transaction::CallArg::Pure(amt),
+        ],
+        commands: vec![move_call(
+            sui_pkg(),
+            "coin",
+            "split",
+            vec![sui_type()],
+            vec![Argument::Input(0), Argument::Input(1)],
+        )],
+    }
+}
+
+// Scenario 68 — `coin::join` via MoveCall on two owned coin inputs.
+fn move_call_coin_join(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.owned_coin_input(),
+            refs.second_owned_coin_input(),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![
+            move_call(
+                sui_pkg(),
+                "coin",
+                "join",
+                vec![sui_type()],
+                vec![Argument::Input(0), Argument::Input(1)],
+            ),
+            Command::TransferObjects(vec![Argument::Input(0)], Argument::Input(2)),
+        ],
+    }
+}
+
+// Scenario 69 — `transfer::public_freeze_object<KeyBox>`.
+fn move_call_public_freeze_key_box(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.parent_key_box_input()],
+        commands: vec![move_call(
+            sui_pkg(),
+            "transfer",
+            "public_freeze_object",
+            vec![key_box_type()],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// Scenario 70 — `transfer::public_share_object<KeyBox>`.
+fn move_call_public_share_key_box(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![refs.parent_key_box_input()],
+        commands: vec![move_call(
+            sui_pkg(),
+            "transfer",
+            "public_share_object",
+            vec![key_box_type()],
+            vec![Argument::Input(0)],
+        )],
+    }
+}
+
+// Scenario 71 — `transfer::transfer<KeyBox>` hits private-generics rejection.
+fn err_transfer_private_generics(refs: FuzzHarnessObjectRefs) -> ProgrammableTransaction {
+    let addr = bcs::to_bytes(&SuiAddress::ZERO).unwrap();
+    ProgrammableTransaction {
+        inputs: vec![
+            refs.parent_key_box_input(),
+            sui_types::transaction::CallArg::Pure(addr),
+        ],
+        commands: vec![move_call(
+            sui_pkg(),
+            "transfer",
+            "transfer",
+            vec![key_box_type()],
+            vec![Argument::Input(0), Argument::Input(1)],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 /// Returns the process's anonymous RSS in bytes from `/proc/self/status` (RssAnon).
 ///
@@ -996,6 +1596,18 @@ fn main() {
     let dir = Path::new("corpus");
     fs::create_dir_all(dir).expect("failed to create corpus/");
 
+    // Regenerate from scratch so stale `.bin` files from prior runs are not validated.
+    for entry in fs::read_dir(dir).expect("failed to read corpus/") {
+        let entry = entry.expect("failed to read corpus entry");
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "bin") {
+            fs::remove_file(&path)
+                .unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
+        }
+    }
+
+    let (_harness_objects, harness_refs) = build_fuzz_harness_objects();
+
     write(dir, "01_minimal_transfer", minimal_transfer());
     write(dir, "02_empty_ptb", empty_ptb());
     write(dir, "03_split_merge_chain_512", split_merge_chain(512));
@@ -1028,6 +1640,145 @@ fn main() {
     write(dir, "30_fixture_multi_return", fixture_multi_return());
     write(dir, "31_fixture_make_pair", fixture_make_pair());
     write(dir, "32_fixture_reference_arg", fixture_reference_arg());
+    write(dir, "33_split_owned_coin", split_owned_coin(harness_refs));
+    write(dir, "34_merge_two_owned_coins", merge_two_owned_coins(harness_refs));
+    write(dir, "35_transfer_owned_coin", transfer_owned_coin(harness_refs));
+    write(dir, "36_split_shared_coin", split_shared_coin(harness_refs));
+    write(
+        dir,
+        "37_move_call_immutable_coin_ref",
+        move_call_immutable_coin_ref(harness_refs),
+    );
+    write(
+        dir,
+        "38_move_call_owned_coin_ref",
+        move_call_owned_coin_ref(harness_refs),
+    );
+    write(dir, "39_transfer_key_box_object", transfer_key_box_object(harness_refs));
+    write(
+        dir,
+        "40_move_call_key_box_by_value",
+        move_call_key_box_by_value(harness_refs),
+    );
+    write(
+        dir,
+        "41_move_call_key_box_ref",
+        move_call_key_box_ref(harness_refs),
+    );
+    write(
+        dir,
+        "42_receive_sui_coin_to_parent",
+        receive_sui_coin_to_parent(harness_refs),
+    );
+    write(
+        dir,
+        "43_receive_key_box_to_parent",
+        receive_key_box_to_parent(harness_refs),
+    );
+    write(dir, "44_err_fixture_wrong_arity", err_fixture_wrong_arity());
+    write(dir, "45_err_fixture_wrong_primitive", err_fixture_wrong_primitive());
+    write(dir, "46_err_input_index_oob", err_input_index_oob());
+    write(
+        dir,
+        "47_err_coin_value_wrong_type_arg",
+        err_coin_value_wrong_type_arg(harness_refs),
+    );
+    write(
+        dir,
+        "48_err_nested_result_secondary_oob",
+        err_nested_result_secondary_oob(),
+    );
+    write(
+        dir,
+        "49_err_merge_invalid_result_arity",
+        err_merge_invalid_result_arity(harness_refs),
+    );
+    write(
+        dir,
+        "50_err_transfer_immutable_by_value",
+        err_transfer_immutable_by_value(harness_refs),
+    );
+    write(dir, "51_err_option_inner_type_mismatch", err_option_inner_type_mismatch());
+    write(
+        dir,
+        "52_err_mut_ref_on_coin_object",
+        err_mut_ref_on_coin_object(harness_refs),
+    );
+    write(
+        dir,
+        "53_err_make_move_vec_elem_type_mismatch",
+        err_make_move_vec_elem_type_mismatch(),
+    );
+    write(
+        dir,
+        "54_err_object_input_reuse_after_move",
+        err_object_input_reuse_after_move(harness_refs),
+    );
+    write(dir, "55_err_result_index_oob", err_result_index_oob());
+    write(
+        dir,
+        "56_err_transfer_wrong_recipient_type",
+        err_transfer_wrong_recipient_type(),
+    );
+    write(
+        dir,
+        "57_err_split_immutable_coin",
+        err_split_immutable_coin(harness_refs),
+    );
+    write(
+        dir,
+        "58_err_fixture_struct_type_mismatch",
+        err_fixture_struct_type_mismatch(),
+    );
+    write(
+        dir,
+        "59_err_from_u256_truncated_bytes",
+        err_from_u256_truncated_bytes(),
+    );
+    write(dir, "60_err_private_non_entry", err_private_non_entry());
+    write(dir, "61_fixture_private_entry_ok", fixture_private_entry_ok());
+    write(
+        dir,
+        "62_err_hot_potato_private_entry",
+        err_hot_potato_private_entry(),
+    );
+    write(dir, "63_err_unused_hot_potato", err_unused_hot_potato());
+    write(
+        dir,
+        "64_err_unused_multi_return_hot_potato",
+        err_unused_multi_return_hot_potato(),
+    );
+    write(dir, "65_fixture_mut_ref_pure_u64", fixture_mut_ref_pure_u64());
+    write(
+        dir,
+        "66_move_call_coin_split_consume",
+        move_call_coin_split_consume(harness_refs),
+    );
+    write(
+        dir,
+        "67_err_unused_coin_split_result",
+        err_unused_coin_split_result(harness_refs),
+    );
+    write(
+        dir,
+        "68_move_call_coin_join",
+        move_call_coin_join(harness_refs),
+    );
+    write(
+        dir,
+        "69_move_call_public_freeze_key_box",
+        move_call_public_freeze_key_box(harness_refs),
+    );
+    write(
+        dir,
+        "70_move_call_public_share_key_box",
+        move_call_public_share_key_box(harness_refs),
+    );
+    write(
+        dir,
+        "71_err_transfer_private_generics",
+        err_transfer_private_generics(harness_refs),
+    );
 
     println!("\nCorpus ready in ./corpus/\n");
 
