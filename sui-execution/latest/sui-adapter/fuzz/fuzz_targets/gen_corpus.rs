@@ -1504,6 +1504,150 @@ fn err_transfer_private_generics(refs: FuzzHarnessObjectRefs) -> ProgrammableTra
 }
 
 // ---------------------------------------------------------------------------
+// Helpers for fuzz_fixture struct type inputs (used by ability-violation seeds)
+// ---------------------------------------------------------------------------
+
+fn box_type_input() -> TypeInput {
+    TypeInput::Struct(Box::new(StructInput {
+        address: AccountAddress::from(fixture::fuzz_fixture::package_id()),
+        module: "fuzz_fixture".to_owned(),
+        name: "Box".to_owned(),
+        type_params: vec![],
+    }))
+}
+
+fn drop_only_type_input() -> TypeInput {
+    TypeInput::Struct(Box::new(StructInput {
+        address: AccountAddress::from(fixture::fuzz_fixture::package_id()),
+        module: "fuzz_fixture".to_owned(),
+        name: "DropOnly".to_owned(),
+        type_params: vec![],
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios 72–80 — exercises new fixture functions added to unlock uncovered
+// typing-pass branches.
+// ---------------------------------------------------------------------------
+
+// Scenario 72 — pair_transform<A, B>: two independently-bounded generics.
+// pair_transform<u64, bool>(u64, bool) → (bool, u64). Both results droppable.
+fn fixture_pair_transform() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![
+            sui_types::transaction::CallArg::Pure(bcs::to_bytes(&42u64).unwrap()),
+            sui_types::transaction::CallArg::Pure(bcs::to_bytes(&true).unwrap()),
+        ],
+        commands: vec![fixture_call(
+            "pair_transform",
+            vec![TypeInput::U64, TypeInput::Bool],
+            vec![Argument::Input(0), Argument::Input(1)],
+        )],
+    }
+}
+
+// Scenario 73 — three_generics<A, B, C>: three drop-bound type params.
+// three_generics<u64, bool, address>(u64, bool, addr) → u64.
+fn fixture_three_generics() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![
+            sui_types::transaction::CallArg::Pure(bcs::to_bytes(&1u64).unwrap()),
+            sui_types::transaction::CallArg::Pure(bcs::to_bytes(&false).unwrap()),
+            sui_types::transaction::CallArg::Pure(bcs::to_bytes(&SuiAddress::ZERO).unwrap()),
+        ],
+        commands: vec![fixture_call(
+            "three_generics",
+            vec![TypeInput::U64, TypeInput::Bool, TypeInput::Address],
+            vec![Argument::Input(0), Argument::Input(1), Argument::Input(2)],
+        )],
+    }
+}
+
+// Scenario 74 — three_vals(): 3-tuple return consumed via NestedResult sub-indices 0, 1, 2.
+fn fixture_three_vals() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![
+            fixture_call("three_vals", vec![], vec![]),
+            fixture_call("take_u64",  vec![], vec![Argument::NestedResult(0, 0)]),
+            fixture_call("take_bool", vec![], vec![Argument::NestedResult(0, 1)]),
+            // sub-result 2 is `address` — droppable, left unconsumed
+        ],
+    }
+}
+
+// Scenario 75 — store_id<Box>: Box has copy+drop+store so the store constraint is satisfied.
+// new_box(v) → R(0), store_id<Box>(R(0)) → Box (droppable).
+fn fixture_store_id_valid() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&7u64).unwrap())],
+        commands: vec![
+            fixture_call("new_box", vec![], vec![Argument::Input(0)]),
+            fixture_call("store_id", vec![box_type_input()], vec![Argument::Result(0)]),
+        ],
+    }
+}
+
+// Scenario 76 — copy_store_id<Box>: Box satisfies the copy+store constraint.
+fn fixture_copy_store_id_valid() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&3u64).unwrap())],
+        commands: vec![
+            fixture_call("new_box", vec![], vec![Argument::Input(0)]),
+            fixture_call("copy_store_id", vec![box_type_input()], vec![Argument::Result(0)]),
+        ],
+    }
+}
+
+// Scenario 77 — make_drop_only: produces a DropOnly{drop} result, which can be discarded.
+fn fixture_make_drop_only() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![sui_types::transaction::CallArg::Pure(bcs::to_bytes(&5u64).unwrap())],
+        commands: vec![fixture_call("make_drop_only", vec![], vec![Argument::Input(0)])],
+    }
+}
+
+// Error seed 78 — ability constraint violation: store_id<DropOnly>.
+// DropOnly has `drop` only — it does NOT have `store` — so the store constraint fires.
+fn err_store_id_ability_violation() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![fixture_call(
+            "store_id",
+            vec![drop_only_type_input()], // DropOnly has no `store` → ability violation
+            vec![],                        // arg count also wrong, but ability check fires first
+        )],
+    }
+}
+
+// Error seed 79 — ability constraint violation: ignore<KeyBox>.
+// ignore<T: drop>(_x: T): KeyBox has key+store but NOT drop → violation.
+fn err_ignore_ability_violation() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![fixture_call(
+            "ignore",
+            vec![key_box_type()], // KeyBox has no `drop` → constraint violated
+            vec![],               // arg count also wrong, but ability check fires first
+        )],
+    }
+}
+
+// Error seed 80 — too many type args on a zero-param generic function.
+// three_vals() has no type parameters; passing three type args exercises the
+// "type-arg count too high" branch distinct from "too low" (seed 42).
+fn err_three_vals_spurious_type_args() -> ProgrammableTransaction {
+    ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![fixture_call(
+            "three_vals",
+            vec![TypeInput::U64, TypeInput::Bool, TypeInput::Address],
+            vec![],
+        )],
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 fn current_heap_bytes() -> u64 {
     // Advancing the epoch flushes per-thread cache into the global stats.
@@ -1739,6 +1883,15 @@ fn main() {
         "71_err_transfer_private_generics",
         err_transfer_private_generics(harness_refs),
     );
+    write(dir, "72_fixture_pair_transform",       fixture_pair_transform());
+    write(dir, "73_fixture_three_generics",        fixture_three_generics());
+    write(dir, "74_fixture_three_vals",            fixture_three_vals());
+    write(dir, "75_fixture_store_id_valid",        fixture_store_id_valid());
+    write(dir, "76_fixture_copy_store_id_valid",   fixture_copy_store_id_valid());
+    write(dir, "77_fixture_make_drop_only",        fixture_make_drop_only());
+    write(dir, "78_err_store_id_ability_violation",   err_store_id_ability_violation());
+    write(dir, "79_err_ignore_ability_violation",     err_ignore_ability_violation());
+    write(dir, "80_err_three_vals_spurious_type_args", err_three_vals_spurious_type_args());
 
     println!("\nCorpus ready in ./corpus/\n");
 

@@ -129,6 +129,33 @@ module 0xface::fuzz_fixture {
     entry fun take_hot_potato(h: HotPotato) {
         let HotPotato { v: _ } = h;
     }
+
+    // -----------------------------------------------------------------------
+    // Ability-diverse types and functions — expand typing-pass coverage
+    // -----------------------------------------------------------------------
+
+    /// drop-only: has drop but not copy, store, or key.
+    /// Used by ability-violation seeds where store or copy is required.
+    public struct DropOnly has drop { v: u64 }
+    public fun make_drop_only(v: u64): DropOnly { DropOnly { v } }
+
+    /// Generic with a store constraint.  Pair with DropOnly (no store) for
+    /// ability-violation seeds; pair with Box (copy+drop+store) for valid seeds.
+    public fun store_id<T: store>(x: T): T { x }
+
+    /// Generic with copy + store constraint.
+    public fun copy_store_id<T: copy + store>(x: T): T { x }
+
+    /// Two independent generics with different ability constraints.
+    /// Exercises the 2-type-param generic instantiation path.
+    public fun pair_transform<A: copy + drop, B: copy + drop>(a: A, b: B): (B, A) { (b, a) }
+
+    /// Three independent drop-bound generics.
+    /// Exercises 3-type-param instantiation.
+    public fun three_generics<A: drop, B: drop, C: drop>(a: A, _b: B, _c: C): A { a }
+
+    /// Returns a 3-tuple — exercises NestedResult sub-indices 0, 1, 2 in seeds.
+    public fun three_vals(): (u64, bool, address) { (0, false, @0x0) }
 }
 "#;
 
