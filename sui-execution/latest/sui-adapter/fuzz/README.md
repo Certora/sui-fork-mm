@@ -130,7 +130,7 @@ Run it against the whole directory:
 Output is one line per file:
 
 ```
-file                                                            bytes  stage         anon_rss∆   wall_ms
+file                                                            bytes  stage            heap∆   wall_ms
 ----------------------------------------------------------------------------------------------------------
 e101a7f8bedac268                                             1260376  typing_ok        9.3 MiB        24
 9eb9b79caa72d02d                                               1424  decode_fail      0.0 MiB         0
@@ -248,15 +248,22 @@ real package resolution.
 | `24_make_move_vec_none_infer` | `MakeMoveVec(None, [addr, addr])` — type inferred, not annotated | `MakeMoveVec` element-type inference branch; object-type validation error path |
 | `25_make_move_vec_empty_typed` | `MakeMoveVec<u64>([])` — typed but empty | Zero-argument branch of `MakeMoveVec` typing |
 
-### Tier 3 — MoveCall into the synthetic fuzz-fixture package (26–32)
+### Tier 3 — MoveCall into the synthetic fuzz-fixture package (26–80)
 
 The fuzz-fixture package ([`fuzz_fixture.rs`](fuzz_targets/fuzz_fixture.rs), address
-`0xface`) is compiled at harness startup and
-injected into the in-memory store alongside the system packages.  It exposes a
-wide variety of function signatures — primitives, vectors, references, generics
-with ability bounds, user-defined structs, and multiple-return functions — so
-`MoveCall` seeds have a controllable, resolvable target that covers paths the
-framework seeds cannot reach.
+`0xface`) is compiled at harness startup and injected into the in-memory store
+alongside the system packages.  It exposes a wide variety of function signatures
+and object types so `MoveCall` seeds have a controllable, resolvable target that
+covers paths the framework seeds cannot reach:
+
+- **Structs**: `Box` (copy+drop+store), `Pair<T>` (copy+drop), `KeyBox` (key+store),
+  `HotPotato` (copy only — non-droppable), `DropOnly` (drop only)
+- **Functions**: primitives, vectors, immutable/mutable references, generics with
+  single/double/triple ability bounds, struct constructors, multiple-return tuples,
+  entry/private visibility variants, object-by-value and object-by-reference variants,
+  and `Receiving<T>` parameters
+
+#### 26–32: basic fixture MoveCall (pure inputs only)
 
 | File | Strategy | What it stresses |
 |------|----------|-----------------|
@@ -267,6 +274,79 @@ framework seeds cannot reach.
 | `30_fixture_multi_return` | `two_values() → (u64, bool)`, components consumed via `NestedResult` | `NestedResult` sub-index on a MoveCall multiple-return |
 | `31_fixture_make_pair` | `make_pair<u64>(u64, u64) → Pair<u64>` — copyable pure input reused twice | Generic struct constructor with ability bounds; pure-input reuse |
 | `32_fixture_reference_arg` | `use_imm_ref(&u64) → u64` | Borrow inference for a pure input passed to a user function's `&T` |
+
+#### 33–43: object-input seeds
+
+These seeds use `CallArg::Object` — owned, shared, immutable, and `Receiving` objects
+from the fixture store.  They drive the object-input loading and borrow-tracking paths
+that pure-input seeds never reach.
+
+| File | Strategy | What it stresses |
+|------|----------|-----------------|
+| `33_split_owned_coin` | `SplitCoins` on an owned `Coin` object input | `ImmOrOwnedObject` loading; owned-coin memory-safety tracking |
+| `34_merge_two_owned_coins` | `MergeCoins` across two distinct owned coin inputs | Multiple object inputs; MergeCoins fan-in on non-gas coins |
+| `35_transfer_owned_coin` | `TransferObjects` consuming an owned coin | Object-input by-value transfer path |
+| `36_split_shared_coin` | `SplitCoins` on a `SharedObject{mutable}` coin | Shared-object loading; mutable shared-object borrow tracking |
+| `37_move_call_immutable_coin_ref` | `coin::value(&Coin<SUI>)` with an immutable coin | `ImmOrOwnedObject` passed as `&T` to a framework function |
+| `38_move_call_owned_coin_ref` | `coin::value(&Coin<SUI>)` with an owned coin | Owned-object borrow as immutable ref |
+| `39_transfer_key_box_object` | `transfer::transfer(KeyBox, addr)` — transfers a `key+store` object | `key` object by value to a transfer call |
+| `40_move_call_key_box_by_value` | `take_key_box(KeyBox) → u64` | User-function consuming a `key+store` object by value |
+| `41_move_call_key_box_ref` | `key_box_value(&KeyBox) → u64` | Owned object passed as immutable ref to a user function |
+| `42_receive_sui_coin_to_parent` | `receive_sui_coin(&mut KeyBox, Receiving<Coin<SUI>>)` | `Receiving<T>` argument typing; mutable parent object |
+| `43_receive_key_box_to_parent` | `receive_key_box(&mut KeyBox, Receiving<KeyBox>)` | `Receiving<T>` with a user-defined `key` type |
+
+#### 44–71: error-path seeds
+
+Seeds that are expected to return `Err(…)` from the typing/loading pass, targeting
+specific validation branches that well-formed inputs never exercise.
+
+| File | Error exercised |
+|------|----------------|
+| `44_err_fixture_wrong_arity` | Wrong value-argument count to a fixture function |
+| `45_err_fixture_wrong_primitive` | Wrong primitive type (`u8` where `u64` expected) |
+| `46_err_input_index_oob` | `Input(99)` on a single-input PTB |
+| `47_err_coin_value_wrong_type_arg` | `coin::value` called with `Coin<SUI>` as type arg instead of `SUI` |
+| `48_err_nested_result_secondary_oob` | `NestedResult(0, 3)` when command 0 produced only 1 sub-result |
+| `49_err_merge_invalid_result_arity` | `MergeCoins` returns nothing; referencing `Result(0)` |
+| `50_err_transfer_immutable_by_value` | Transferring an `Immutable` coin object by value |
+| `51_err_option_inner_type_mismatch` | `option::some<u64>` with a `u8` BCS input |
+| `52_err_mut_ref_on_coin_object` | `use_mut_ref(&mut u64)` fed an owned coin object |
+| `53_err_make_move_vec_elem_type_mismatch` | `MakeMoveVec<u64>` with a `u8` element |
+| `54_err_object_input_reuse_after_move` | Same `KeyBox` consumed twice by value |
+| `55_err_result_index_oob` | `Result(99)` on an empty command list |
+| `56_err_transfer_wrong_recipient_type` | `TransferObjects` with a non-address recipient |
+| `57_err_split_immutable_coin` | `SplitCoins` on an immutable coin |
+| `58_err_fixture_struct_type_mismatch` | Struct type from one function fed to a parameter expecting a different struct |
+| `59_err_from_u256_truncated_bytes` | `from_u256` with fewer than 32 bytes |
+| `60_err_private_non_entry` | Calling a `fun` (non-public, non-entry) from a PTB |
+| `61_fixture_private_entry_ok` | Calling an `entry fun` from a PTB — valid |
+| `62_err_hot_potato_private_entry` | Hot-potato passed to a `fun` (not `entry`) — rejected |
+| `63_err_unused_hot_potato` | `make_hot_potato()` with no consumer — non-droppable result leaked |
+| `64_err_unused_multi_return_hot_potato` | `two_hot_potatoes()` with no consumers |
+| `65_fixture_mut_ref_pure_u64` | `use_mut_ref(&mut u64)` with a pure input — valid borrow |
+| `66_move_call_coin_split_consume` | `coin::split` on an owned coin, result transferred |
+| `67_err_unused_coin_split_result` | `coin::split` result left unconsumed (non-droppable `Coin`) |
+| `68_move_call_coin_join` | `coin::join` merging two coins |
+| `69_move_call_public_freeze_key_box` | `transfer::freeze_object(KeyBox)` — permanently freezes |
+| `70_move_call_public_share_key_box` | `transfer::share_object(KeyBox)` — makes shared |
+| `71_err_transfer_private_generics` | `transfer::transfer` with a type that has private generics |
+
+#### 72–80: ability-diverse generics and error paths
+
+Seeds targeting the generic-instantiation and ability-constraint branches added to
+the fixture in a second pass, after coverage analysis showed those paths were unreached.
+
+| File | Strategy | What it stresses |
+|------|----------|-----------------|
+| `72_fixture_pair_transform` | `pair_transform<u64, bool>(u64, bool) → (bool, u64)` | 2-type-param instantiation with independent `copy+drop` bounds on each |
+| `73_fixture_three_generics` | `three_generics<u64, bool, address>(u64, bool, addr) → u64` | 3-type-param instantiation; drop-only constraints |
+| `74_fixture_three_vals` | `three_vals() → (u64, bool, address)`, sub-results consumed via `NestedResult(0, 0..2)` | 3-element tuple return; all three `NestedResult` sub-indices |
+| `75_fixture_store_id_valid` | `store_id<Box>(new_box(v)) → Box` — `Box` satisfies the `store` constraint | `store`-bound generic with a valid type arg |
+| `76_fixture_copy_store_id_valid` | `copy_store_id<Box>(new_box(v)) → Box` — `Box` satisfies `copy + store` | `copy + store`-bound generic instantiation path |
+| `77_fixture_make_drop_only` | `make_drop_only(v) → DropOnly` — result has only `drop` | Drop-only result type; no `copy` or `store` |
+| `78_err_store_id_ability_violation` | `store_id<DropOnly>` — `DropOnly` has `drop` only, not `store` | Bytecode verifier ability-constraint failure in loading pass |
+| `79_err_ignore_ability_violation` | `ignore<KeyBox>` — `KeyBox` has `key+store`, not `drop` | Same; `drop`-bound violation |
+| `80_err_three_vals_spurious_type_args` | `three_vals<u64, bool, address>()` — function has 0 type params | Type-argument count mismatch (too many) in loading pass |
 
 ---
 
